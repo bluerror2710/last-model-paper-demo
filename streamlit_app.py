@@ -21,7 +21,7 @@ with st.sidebar:
     page = st.radio("Page", ["Main", "Reliability"], index=0)
     manual_controls = st.checkbox("Manual controls", value=True)
     manual_cooldown = st.slider("Cooldown bars", 0, 20, 3)
-    manual_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
+    manual_risk_pct = st.slider("Max risk per trade (%)", 0.2, 10.0, 1.0, 0.1) / 100.0
     fast_mode = st.checkbox("Fast mode", value=True)
     run_reliability_now = st.button("Run reliability now")
 
