@@ -143,8 +143,8 @@ if STATUS_PATH.exists():
         cum_pct = float(bs.get("cum_pct", 0.0))
         capital = float(bs.get("capital", 10000.0))
 
-        st.sidebar.metric("Cumulative P/L", f"{cum_pnl:+.2f} USD", f"{cum_pct:+.2f}%")
-        st.sidebar.metric("Paper Capital", f"{capital:.2f} USD")
+        st.sidebar.metric("Cumulative P/L", f"{cum_pnl:+.2f} EUR", f"{cum_pct:+.2f}%")
+        st.sidebar.metric("Paper Capital", f"{capital:.2f} EUR")
 
         # Progress bar centered at 50% => 0% P/L, clipped at -20%..+20%
         lo, hi = -20.0, 20.0
@@ -205,7 +205,7 @@ st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Sco
 if STATUS_PATH.exists():
     try:
         bs = json.loads(STATUS_PATH.read_text())
-        st.info(f"Bot cumulative P/L: {float(bs.get('cum_pnl',0.0)):+.2f} USD ({float(bs.get('cum_pct',0.0)):+.2f}%)")
+        st.info(f"Bot cumulative P/L: {float(bs.get('cum_pnl',0.0)):+.2f} EUR ({float(bs.get('cum_pct',0.0)):+.2f}%)")
     except Exception:
         pass
 
@@ -252,7 +252,7 @@ r4.metric("Test return / DD", f"{rel_return:+.2f}% / {rel_dd:.2f}%")
 st.caption(f"Parameters for this reliability test: RSI buy>{rb_t}, RSI sell<{rs_t}, Vol min>{vm_t:.3f}")
 
 # simple paper bot simulation (no real money)
-start_cap = st.sidebar.number_input("Paper start capital", min_value=100.0, value=10000.0, step=100.0)
+start_cap = st.sidebar.number_input("Paper start capital (EUR)", min_value=100.0, value=10000.0, step=100.0)
 risk_per_trade = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
 
 pos = 0
@@ -281,10 +281,12 @@ paper_dd = curve / curve.cummax() - 1
 paper_ret = (curve.iloc[-1] / start_cap - 1) * 100
 win_rate = (np.array(trades) > 0).mean() * 100 if trades else 0.0
 
-pc1,pc2,pc3 = st.columns(3)
+pc1,pc2,pc3,pc4 = st.columns(4)
 pc1.metric("Paper bot return", f"{paper_ret:.2f}%")
 pc2.metric("Paper bot max DD", f"{paper_dd.min()*100:.2f}%")
 pc3.metric("Paper bot win rate", f"{win_rate:.1f}%")
+pc4.metric("End capital", f"{capital:.2f} EUR")
+st.caption(f"Start capital: {start_cap:.2f} EUR → End capital: {capital:.2f} EUR (P/L: {capital-start_cap:+.2f} EUR)")
 
 # tabs
 T1, T2, T3, T4, T5 = st.tabs(["Price & Signals", "Performance", "Risk", "Distributions", "Live Safety"])
