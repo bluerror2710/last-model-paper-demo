@@ -56,9 +56,9 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
     while True:
         try:
             d = add_features(load_data(symbol, period, interval), interval)
-            sh, rb, rs, vm, sig, sret, eq, dd = auto_tune(d)
-            d["signal"] = sig
-            # use latest with cooldown approximation
+            sh, rb, rs, vm, _, _, _, _ = auto_tune(d)
+            _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm)
+            d["signal"] = sig_live
             i = len(d)-1
             s_now = int(d["signal"].iloc[i])
             if cooldown_bars > 0 and (i - last_trade_i) <= cooldown_bars:
@@ -146,15 +146,59 @@ def add_features(df, interval):
 
 
 def score(df, rsi_buy, rsi_sell, vol_min):
-    long_sig = (df["ema_fast"] > df["ema_slow"]) & (df["rsi"] > rsi_buy) & (df["vol"] > vol_min)
-    short_sig = (df["ema_fast"] < df["ema_slow"]) & (df["rsi"] < rsi_sell) & (df["vol"] > vol_min)
+    # Base trend signal
+    trend_sig = pd.Series(0, index=df.index)
+    trend_sig[(df["ema_fast"] > df["ema_slow"]) & (df["rsi"] > rsi_buy) & (df["vol"] > vol_min)] = 1
+    trend_sig[(df["ema_fast"] < df["ema_slow"]) & (df["rsi"] < rsi_sell) & (df["vol"] > vol_min)] = -1
 
+    # Ensemble components
+    mr_sig = pd.Series(0, index=df.index)
+    mr_sig[(df["rsi"] < 30) & (df["ema_fast"] > df["ema_slow"])] = 1
+    mr_sig[(df["rsi"] > 70) & (df["ema_fast"] < df["ema_slow"])] = -1
+    roll_hi = df["close"].rolling(20).max().shift(1)
+    roll_lo = df["close"].rolling(20).min().shift(1)
+    br_sig = pd.Series(0, index=df.index)
+    br_sig[df["close"] > roll_hi] = 1
+    br_sig[df["close"] < roll_lo] = -1
+
+    vote = trend_sig + mr_sig + br_sig
     sig = pd.Series(0, index=df.index)
-    sig[long_sig] = 1
-    sig[short_sig] = -1
+    sig[vote >= 2] = 1
+    sig[vote <= -2] = -1
+    sig = sig.where(sig != 0, trend_sig)
 
+    # Multi-timeframe confirmation
+    sig = sig.where(~((sig == 1) & (df["htf_up"] == 0)), 0)
+    sig = sig.where(~((sig == -1) & (df["htf_up"] == 1)), 0)
+
+    # Regime/vol filters
+    sig = sig.where(df["vol"] > max(vol_min * 0.8, 0.001), 0)
+    sig = sig.where(df["trend_spread"].abs() > 0.0015, 0)
+
+    # Optional news blackout + execution realism controls from sidebar
+    if use_news_blackout:
+        sig = sig.where(~blackout_mask(df.index), 0)
+
+    # Cooldown to reduce overtrading
+    if cooldown_bars > 0:
+        vals = sig.values.copy()
+        last_trade = -10**9
+        for i in range(len(vals)):
+            if vals[i] != 0:
+                if i - last_trade <= cooldown_bars:
+                    vals[i] = 0
+                else:
+                    last_trade = i
+        sig = pd.Series(vals, index=df.index)
+
+    # Confidence sizing + costs
+    confidence = (vote.abs() / 3.0).clip(0.34, 1.0)
     pos = sig.replace(0, np.nan).ffill().fillna(0)
-    sret = pos.shift(1).fillna(0) * df["ret"].fillna(0)
+    gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
+    turnover = pos.diff().abs().fillna(0)
+    cost = turnover * ((fee_bps + slippage_bps) / 10000.0)
+    sret = gross - cost
+
     equity = (1 + sret).cumprod()
     dd = equity / equity.cummax() - 1
 
@@ -222,62 +266,10 @@ if sig is None or len(sig) == 0:
     st.error("Auto-tuning failed due to insufficient data.")
     st.stop()
 
-# Ensemble (trend + mean-reversion + breakout)
-trend_sig = sig.copy()
-mr_sig = pd.Series(0, index=df.index)
-mr_sig[(df["rsi"] < 30) & (df["ema_fast"] > df["ema_slow"])] = 1
-mr_sig[(df["rsi"] > 70) & (df["ema_fast"] < df["ema_slow"])] = -1
-roll_hi = df["close"].rolling(20).max().shift(1)
-roll_lo = df["close"].rolling(20).min().shift(1)
-br_sig = pd.Series(0, index=df.index)
-br_sig[df["close"] > roll_hi] = 1
-br_sig[df["close"] < roll_lo] = -1
+# Full pipeline score uses all configured options (ensemble, MTF, costs, blackout, cooldown)
+_, sig_full, sret, equity, dd = score(df.copy(), rb, rs, vm)
 
-vote = trend_sig + mr_sig + br_sig
-ens_sig = pd.Series(0, index=df.index)
-ens_sig[vote >= 2] = 1
-ens_sig[vote <= -2] = -1
-
-# fallback to trend signal when ensemble has no vote
-ens_sig = ens_sig.where(ens_sig != 0, trend_sig)
-
-# multi-timeframe confirmation
-ens_sig = ens_sig.where(~((ens_sig == 1) & (df["htf_up"] == 0)), 0)
-ens_sig = ens_sig.where(~((ens_sig == -1) & (df["htf_up"] == 1)), 0)
-
-# risk filter: ignore weak volatility regimes
-ens_sig = ens_sig.where(df["vol"] > max(vm*0.8, 0.001), 0)
-# chop filter: require minimum trend spread
-ens_sig = ens_sig.where(df["trend_spread"].abs() > 0.0015, 0)
-
-# optional news blackout
-if use_news_blackout:
-    ens_sig = ens_sig.where(~blackout_mask(df.index), 0)
-
-# confidence-weighted sizing
-confidence = (vote.abs() / 3.0).clip(0.34, 1.0)
-
-# compute returns from ensemble with execution realism
-pos = ens_sig.replace(0, np.nan).ffill().fillna(0)
-gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
-turnover = pos.diff().abs().fillna(0)
-cost = turnover * ((fee_bps + slippage_bps) / 10000.0)
-sret = gross - cost
-equity = (1 + sret).cumprod()
-dd = equity / equity.cummax() - 1
-
-df["signal"] = ens_sig
-# cooldown to reduce overtrading
-if cooldown_bars > 0:
-    sig_vals = df["signal"].values.copy()
-    last_trade = -10**9
-    for i in range(len(sig_vals)):
-        if sig_vals[i] != 0:
-            if i - last_trade <= cooldown_bars:
-                sig_vals[i] = 0
-            else:
-                last_trade = i
-    df["signal"] = sig_vals
+df["signal"] = sig_full
 df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
