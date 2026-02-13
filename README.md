@@ -14,6 +14,13 @@ freqtrade backtesting --enable-protections --userdir freqtrade --config freqtrad
 ## Streamlit app (interactive)
 ```bash
 source .venv/bin/activate
-pip install streamlit plotly yfinance pandas numpy
+pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
+
+## Deploy on Streamlit Community Cloud
+- Repo root contains:
+  - `streamlit_app.py` (entrypoint)
+  - `requirements.txt`
+  - `.streamlit/config.toml`
+- In Streamlit Cloud, set app file to: `streamlit_app.py`
