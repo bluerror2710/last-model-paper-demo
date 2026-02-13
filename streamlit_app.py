@@ -4,6 +4,8 @@ import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import threading, time, json
+from pathlib import Path
 
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
 st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
@@ -13,6 +15,56 @@ with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "NFLX", "SPY", "QQQ", "GLD", "EURUSD=X", "JPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1h", "4h", "1d"], index=0)
+
+
+STATUS_PATH = Path(__file__).with_name("bot_status.json")
+
+def _bot_loop(symbol: str, period: str, interval: str, start_capital: float = 10000.0):
+    capital = start_capital
+    pos = 0
+    entry = 0.0
+    trades = []
+    while True:
+        try:
+            d = add_features(load_data(symbol, period, interval), interval)
+            sh, rb, rs, vm, sig, sret, eq, dd = auto_tune(d)
+            d["signal"] = sig
+            last = d.iloc[-1]
+            s_now = int(last["signal"])
+            price = float(last["close"])
+
+            if pos != 0 and s_now == -pos:
+                pnl = (price - entry) / entry * pos * (capital * 0.01 * 5)
+                capital += pnl
+                trades.append(pnl)
+                pos = 0
+            if pos == 0 and s_now != 0:
+                pos = s_now
+                entry = price
+
+            status = {
+                "ts": str(d.index[-1]),
+                "symbol": symbol,
+                "price": price,
+                "signal": "BUY" if s_now==1 else ("SELL" if s_now==-1 else "HOLD"),
+                "capital": round(capital, 2),
+                "position": "LONG" if pos==1 else ("SHORT" if pos==-1 else "FLAT"),
+                "trades": len(trades),
+                "win_rate": round((np.mean(np.array(trades)>0)*100) if trades else 0.0, 2),
+                "params": {"rsi_buy": rb, "rsi_sell": rs, "vol_min": vm, "score": round(sh,3)}
+            }
+            STATUS_PATH.write_text(json.dumps(status, indent=2))
+        except Exception as e:
+            STATUS_PATH.write_text(json.dumps({"error": str(e), "symbol": symbol}, indent=2))
+
+        sleep_sec = 300 if interval == "1h" else (900 if interval == "4h" else 3600)
+        time.sleep(sleep_sec)
+
+@st.cache_resource
+def start_embedded_bot(symbol: str, period: str, interval: str):
+    t = threading.Thread(target=_bot_loop, args=(symbol, period, interval), daemon=True)
+    t.start()
+    return True
 
 
 def load_data(symbol, period, interval):
@@ -74,6 +126,17 @@ def auto_tune(df):
                     best = (sh, rb, rs, vm, sig, sret, eq, dd)
     return best
 
+
+start_embedded_bot(ticker, period, interval)
+
+# bot progress panel
+if STATUS_PATH.exists():
+    try:
+        st.sidebar.subheader("Bot Progress")
+        bs = json.loads(STATUS_PATH.read_text())
+        st.sidebar.json(bs)
+    except Exception:
+        pass
 
 df = add_features(load_data(ticker, period, interval), interval)
 sh, rb, rs, vm, sig, sret, equity, dd = auto_tune(df)
