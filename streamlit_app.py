@@ -15,8 +15,6 @@ with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
-    playground_cutoff = st.slider("Playground: analyze up to % of history", 50, 100, 100)
-    reliability_window = st.slider("Playground window (bars)", 100, 3000, 800, 50)
 
 
 STATUS_PATH = Path(__file__).with_name("bot_status.json")
@@ -180,19 +178,6 @@ df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
 
-# Playground: use historical cutoff so you can inspect past behavior
-if playground_cutoff < 100:
-    cut = max(1, int(len(df) * playground_cutoff / 100))
-    df = df.iloc[:cut].copy()
-
-# Reliability view on recent window
-rel_df = df.tail(min(reliability_window, len(df))).copy()
-mask = rel_df["signal"] != 0
-if mask.any():
-    signal_hits = ((rel_df["signal"].shift(1) * rel_df["ret"]) > 0) & mask
-    reliability = float(signal_hits.sum() / mask.sum() * 100)
-else:
-    reliability = 0.0
 
 if df.empty:
     st.error("Dataset is empty after processing.")
@@ -221,7 +206,6 @@ if STATUS_PATH.exists():
     try:
         bs = json.loads(STATUS_PATH.read_text())
         st.info(f"Bot cumulative P/L: {float(bs.get('cum_pnl',0.0)):+.2f} USD ({float(bs.get('cum_pct',0.0)):+.2f}%)")
-        st.caption(f"Playground cutoff: {playground_cutoff}% of history | Reliability window: {min(reliability_window, len(df))} bars")
     except Exception:
         pass
 
@@ -229,10 +213,43 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Price", f"{latest['close']:.2f}")
 c2.metric("Proxy return", f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
 c3.metric("Max drawdown", f"{df['drawdown'].min()*100:.2f}%")
-c4.metric("Reliability (signals)", f"{reliability:.1f}%")
+c4.metric("Signal activity", f"{(df["signal"]!=0).mean()*100:.1f}%")
 
 with st.expander("Why this signal?"):
     st.write(reasons)
+
+
+# Fixed reliability test:
+# Tune on history BEFORE last month, test on last month (no knobs)
+if len(df) > 200:
+    split_idx = max(1, len(df) - max(30, len(df)//12))
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    sh_t, rb_t, rs_t, vm_t, *_ = auto_tune(train_df)
+    _, sig_test, sret_test, eq_test, dd_test = score(test_df.copy(), rb_t, rs_t, vm_t)
+    test_df['sig_test'] = sig_test
+    test_df['eq_test'] = eq_test
+    test_df['dd_test'] = dd_test
+
+    m = test_df['sig_test'] != 0
+    if m.any():
+        hit = (((test_df['sig_test'].shift(1) * test_df['ret']) > 0) & m).sum() / m.sum() * 100
+    else:
+        hit = 0.0
+    rel_return = (test_df['eq_test'].iloc[-1] - 1) * 100
+    rel_dd = test_df['dd_test'].min() * 100
+else:
+    rb_t, rs_t, vm_t = rb, rs, vm
+    hit, rel_return, rel_dd = 0.0, 0.0, 0.0
+
+st.subheader("Reliability check (fixed, no settings)")
+r1, r2, r3, r4 = st.columns(4)
+r1.metric("Train window", "From ~12 months ago")
+r2.metric("Test window", "Last month")
+r3.metric("Signal hit rate", f"{hit:.1f}%")
+r4.metric("Test return / DD", f"{rel_return:+.2f}% / {rel_dd:.2f}%")
+st.caption(f"Parameters for this reliability test: RSI buy>{rb_t}, RSI sell<{rs_t}, Vol min>{vm_t:.3f}")
 
 # simple paper bot simulation (no real money)
 start_cap = st.sidebar.number_input("Paper start capital", min_value=100.0, value=10000.0, step=100.0)
@@ -312,6 +329,13 @@ with T4:
     st.plotly_chart(fig4, use_container_width=True)
 
     by_signal = df.groupby("signal")["ret"].mean().rename({-1: "sell", 0: "hold", 1: "buy"})
+
+    if len(df) > 200:
+        fig_rel = go.Figure()
+        fig_rel.add_trace(go.Scatter(x=test_df.index, y=test_df['eq_test'], name='Last-month equity (out-of-sample)'))
+        fig_rel.update_layout(height=300, title='Reliability test equity (trained on prior data, tested on last month)')
+        st.plotly_chart(fig_rel, use_container_width=True)
+
     st.write("Average next-period return by signal:")
     st.dataframe(by_signal.to_frame("avg_return"))
 
