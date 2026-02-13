@@ -10,6 +10,7 @@ from pathlib import Path
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
 st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
 st.caption("Auto-tuned per asset/timeframe + ensemble + risk controls. Educational use only.")
+PORTF_UNIVERSE = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AAPL","TSLA","MSFT","NVDA","AMZN","GOOGL","META","SPY","QQQ","GLD"]
 
 with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
@@ -17,6 +18,8 @@ with st.sidebar:
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
     cooldown_bars = st.slider("Cooldown bars", 0, 20, 3)
     max_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
+    portfolio_mode = st.checkbox("Portfolio mode (top 5 assets)", value=True)
+    portfolio_top_n = 5
     fee_bps = st.slider("Fee (bps)", 0.0, 20.0, 5.0, 0.5)
     slippage_bps = st.slider("Slippage (bps)", 0.0, 30.0, 8.0, 0.5)
     use_news_blackout = st.checkbox("Use news blackout", value=True)
@@ -44,6 +47,9 @@ def blackout_mask(index):
 def _status_path(symbol: str, interval: str) -> Path:
     safe = symbol.replace("/", "_").replace("=", "_").replace("-", "_")
     return Path(__file__).with_name(f"bot_status_{safe}_{interval}.json")
+
+def _portfolio_status_path(interval: str) -> Path:
+    return Path(__file__).with_name(f"bot_status_portfolio_top5_{interval}.json")
 
 STATUS_PATH = _status_path(ticker, interval)
 
@@ -95,12 +101,75 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
         sleep_sec = sleep_map.get(interval, 300)
         time.sleep(sleep_sec)
 
+def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_capital: float = 10000.0):
+    capital = start_capital
+    positions = {}
+    entries = {}
+    while True:
+        try:
+            rows = []
+            for a in PORTF_UNIVERSE:
+                try:
+                    d = add_features(load_data(a, period, interval), interval)
+                    if d is None or d.empty or len(d) < 120:
+                        continue
+                    sh, rb, rs, vm, *_ = auto_tune(d)
+                    _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm)
+                    s_now = int(sig_live.iloc[-1])
+                    px = float(d['close'].iloc[-1])
+                    rows.append((a, sh, s_now, px))
+                except Exception:
+                    continue
+
+            if rows:
+                top = sorted(rows, key=lambda x: x[1], reverse=True)[:5]
+                active = [r for r in top if r[2] != 0]
+                alloc = (capital * max_risk_pct * 5 / max(1, len(active)))
+
+                # close positions not in active or flipped
+                for a in list(positions.keys()):
+                    row = next((r for r in top if r[0] == a), None)
+                    if row is None or row[2] == 0 or row[2] == -positions[a]:
+                        px = row[3] if row else entries[a]
+                        pnl = (px - entries[a]) / entries[a] * positions[a] * alloc
+                        capital += pnl
+                        positions.pop(a, None)
+                        entries.pop(a, None)
+
+                # open/update active
+                for a, sh, s_now, px in active:
+                    if a not in positions:
+                        positions[a] = s_now
+                        entries[a] = px
+
+            status = {
+                "ts": str(pd.Timestamp.utcnow()),
+                "mode": "portfolio_top5",
+                "capital": round(capital, 2),
+                "cum_pnl": round(capital - start_capital, 2),
+                "cum_pct": round((capital / start_capital - 1) * 100, 2),
+                "active_positions": len(positions),
+            }
+            status_path.write_text(json.dumps(status, indent=2))
+        except Exception as e:
+            status_path.write_text(json.dumps({"error": str(e), "mode": "portfolio_top5", "interval": interval}, indent=2))
+
+        sleep_map = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+        time.sleep(sleep_map.get(interval, 300))
+
 def start_embedded_bot(symbol: str, period: str, interval: str):
-    key = f"{symbol}|{period}|{interval}"
+    mode = "portfolio" if portfolio_mode else "single"
+    key = f"{mode}|{symbol}|{period}|{interval}"
     if st.session_state.get("bot_key") != key:
         st.session_state["bot_key"] = key
-        st.session_state["bot_status_path"] = str(_status_path(symbol, interval))
-        t = threading.Thread(target=_bot_loop, args=(symbol, period, interval, _status_path(symbol, interval)), daemon=True)
+        if portfolio_mode:
+            sp = _portfolio_status_path(interval)
+            st.session_state["bot_status_path"] = str(sp)
+            t = threading.Thread(target=_portfolio_bot_loop, args=(period, interval, sp), daemon=True)
+        else:
+            sp = _status_path(symbol, interval)
+            st.session_state["bot_status_path"] = str(sp)
+            t = threading.Thread(target=_bot_loop, args=(symbol, period, interval, sp), daemon=True)
         t.start()
     return True
 
@@ -237,7 +306,8 @@ if STATUS_PATH.exists():
 
         st.sidebar.metric("Cumulative P/L", f"{cum_pnl:+.2f} EUR", f"{cum_pct:+.2f}%")
         st.sidebar.metric("Paper Capital", f"{capital:.2f} EUR")
-        st.sidebar.caption(f"Symbol/Interval: {ticker} / {interval}")
+        mode_txt = "Portfolio Top-5" if portfolio_mode else f"{ticker}"
+        st.sidebar.caption(f"Mode: {mode_txt} / {interval}")
 
         # Progress bar centered at 50% => 0% P/L, clipped at -20%..+20%
         lo, hi = -20.0, 20.0
