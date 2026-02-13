@@ -273,7 +273,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Price", f"{latest['close']:.2f}")
 c2.metric("Proxy return", f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
 c3.metric("Max drawdown", f"{df['drawdown'].min()*100:.2f}%")
-c4.metric("Signal activity", f"{(df["signal"]!=0).mean()*100:.1f}%")
+c4.metric("Signal activity", f"{(df['signal']!=0).mean()*100:.1f}%")
 
 with st.expander("Why this signal?"):
     st.write(reasons)
