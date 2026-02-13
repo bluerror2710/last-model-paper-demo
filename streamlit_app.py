@@ -3,139 +3,96 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Signal Lab", layout="wide")
-st.title("📈 Signal Lab (Paper-Use)")
-st.caption("Educational signals only. Not financial advice.")
+st.set_page_config(page_title="Auto Signal", layout="wide")
+st.title("🤖 Auto Buy / Hold / Sell")
+st.caption("Thresholds are auto-found from recent data.")
 
 with st.sidebar:
-    st.header("Settings")
     ticker = st.selectbox("Asset", ["BTC-USD", "AAPL", "TSLA", "ETH-USD", "MSFT", "NVDA"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1h", "4h", "1d"], index=0)
 
-    st.subheader("Signal thresholds")
-    rsi_buy = st.slider("RSI buy >", 40, 80, 65)
-    rsi_sell = st.slider("RSI sell <", 20, 60, 35)
-    vol_min = st.slider("Volatility min", 0.0, 0.05, 0.003, step=0.001)
 
-
-def load_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+def load_data(symbol, period, interval):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-    df = df.rename(columns=str.lower).dropna()
-    return df
+    return df.rename(columns=str.lower).dropna()
 
 
-def add_indicators(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    close = df["close"]
-    df["ema_fast"] = close.ewm(span=15, adjust=False).mean()
-    df["ema_slow"] = close.ewm(span=81, adjust=False).mean()
-
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+def add_features(df):
+    c = df['close']
+    df['ema_fast'] = c.ewm(span=15, adjust=False).mean()
+    df['ema_slow'] = c.ewm(span=81, adjust=False).mean()
+    d = c.diff()
+    gain = d.clip(lower=0).rolling(14).mean()
+    loss = (-d.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    ret = close.pct_change()
-    vol_win = 24 if interval in ["1h", "4h"] else 14
-    df["vol"] = ret.rolling(vol_win).std()
-
-    # 4h trend proxy
-    if interval == "1h":
-        df4 = df["close"].resample("4h").last().dropna().to_frame("close")
-        df4["ema50_4h"] = df4["close"].ewm(span=50, adjust=False).mean()
-        df4["ema200_4h"] = df4["close"].ewm(span=200, adjust=False).mean()
-        up = (df4["ema50_4h"] > df4["ema200_4h"]).reindex(df.index, method="ffill")
-        df["uptrend4h"] = up.astype(int)
-    else:
-        df["uptrend4h"] = (df["ema_fast"] > df["ema_slow"]).astype(int)
-
+    df['rsi'] = 100 - (100 / (1 + rs))
+    df['ret'] = c.pct_change()
+    win = 24 if interval in ['1h', '4h'] else 14
+    df['vol'] = df['ret'].rolling(win).std()
     return df.dropna()
 
 
-def add_signals(df: pd.DataFrame, rsi_buy: int, rsi_sell: int, vol_min: float) -> pd.DataFrame:
-    long_sig = (
-        (df["ema_fast"] > df["ema_slow"]) &
-        (df["rsi"] > rsi_buy) &
-        (df["vol"] > vol_min) &
-        (df["uptrend4h"] == 1)
-    )
-    short_sig = (
-        (df["ema_fast"] < df["ema_slow"]) &
-        (df["rsi"] < rsi_sell) &
-        (df["vol"] > vol_min) &
-        (df["uptrend4h"] == 0)
-    )
-
-    df["signal"] = 0
-    df.loc[long_sig, "signal"] = 1
-    df.loc[short_sig, "signal"] = -1
-
-    pos = df["signal"].replace(0, np.nan).ffill().fillna(0)
-    ret = df["close"].pct_change().fillna(0)
-    df["strategy_ret"] = pos.shift(1).fillna(0) * ret
-    df["equity"] = (1 + df["strategy_ret"]).cumprod()
-    df["drawdown"] = df["equity"] / df["equity"].cummax() - 1
-    return df
+def score(df, rsi_buy, rsi_sell, vol_min):
+    long_sig = (df['ema_fast'] > df['ema_slow']) & (df['rsi'] > rsi_buy) & (df['vol'] > vol_min)
+    short_sig = (df['ema_fast'] < df['ema_slow']) & (df['rsi'] < rsi_sell) & (df['vol'] > vol_min)
+    sig = pd.Series(0, index=df.index)
+    sig[long_sig] = 1
+    sig[short_sig] = -1
+    pos = sig.replace(0, np.nan).ffill().fillna(0)
+    sret = pos.shift(1).fillna(0) * df['ret'].fillna(0)
+    if sret.std() == 0:
+        return -999, sig, sret
+    sharpe = (sret.mean() / sret.std()) * np.sqrt(252)
+    return float(sharpe), sig, sret
 
 
-try:
-    data = load_data(ticker, period, interval)
-    data = add_indicators(data, interval)
-    data = add_signals(data, rsi_buy, rsi_sell, vol_min)
-except Exception as e:
-    st.error(f"Data error: {e}")
-    st.stop()
+def auto_tune(df):
+    best = (-999, 65, 35, 0.003, None, None)
+    for rb in [55, 60, 65, 70]:
+        for rs in [30, 35, 40, 45]:
+            if rs >= rb:
+                continue
+            for vm in [0.001, 0.002, 0.003, 0.004, 0.006]:
+                sc, sig, sret = score(df, rb, rs, vm)
+                if sc > best[0]:
+                    best = (sc, rb, rs, vm, sig, sret)
+    return best
 
-latest = data.iloc[-1]
-if latest["signal"] == 1:
-    rec = "🟢 BUY setup"
-elif latest["signal"] == -1:
-    rec = "🔴 SELL/SHORT setup"
-else:
-    rec = "🟡 HOLD / no clear setup"
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Asset", ticker)
-c2.metric("Last price", f"{latest['close']:.2f}")
-c3.metric("Signal now", rec)
-c4.metric("Proxy return", f"{(data['equity'].iloc[-1]-1)*100:.2f}%")
+df = add_features(load_data(ticker, period, interval))
+sh, rb, rs, vm, sig, sret = auto_tune(df)
+df['signal'] = sig
+df['equity'] = (1 + sret).cumprod()
 
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.62, 0.18, 0.20])
-fig.add_trace(go.Candlestick(x=data.index, open=data["open"], high=data["high"], low=data["low"], close=data["close"], name="Price"), row=1, col=1)
-fig.add_trace(go.Scatter(x=data.index, y=data["ema_fast"], name="EMA15", line=dict(width=1.2)), row=1, col=1)
-fig.add_trace(go.Scatter(x=data.index, y=data["ema_slow"], name="EMA81", line=dict(width=1.2)), row=1, col=1)
+now = int(df['signal'].iloc[-1])
+label = 'HOLD'
+color = 'orange'
+if now == 1:
+    label = 'BUY'
+    color = 'green'
+elif now == -1:
+    label = 'SELL'
+    color = 'red'
 
-buy_idx = data.index[data["signal"] == 1]
-sell_idx = data.index[data["signal"] == -1]
-fig.add_trace(go.Scatter(x=buy_idx, y=data.loc[buy_idx, "close"], mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=9)), row=1, col=1)
-fig.add_trace(go.Scatter(x=sell_idx, y=data.loc[sell_idx, "close"], mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=9)), row=1, col=1)
+st.markdown(f"## Signal now: :{color}[**{label}**]")
+st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | score={sh:.2f}")
 
-fig.add_trace(go.Scatter(x=data.index, y=data["rsi"], name="RSI", line=dict(width=1.2)), row=2, col=1)
-fig.add_hline(y=rsi_buy, line_dash="dot", row=2, col=1)
-fig.add_hline(y=rsi_sell, line_dash="dot", row=2, col=1)
+c1,c2,c3 = st.columns(3)
+c1.metric('Price', f"{df['close'].iloc[-1]:.2f}")
+c2.metric('Proxy return', f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
+c3.metric('Last RSI', f"{df['rsi'].iloc[-1]:.1f}")
 
-fig.add_trace(go.Scatter(x=data.index, y=data["equity"], name="Equity", line=dict(width=1.5)), row=3, col=1)
-fig.add_trace(go.Scatter(x=data.index, y=data["drawdown"], name="Drawdown", line=dict(width=1.0)), row=3, col=1)
-
-fig.update_layout(height=900, xaxis_rangeslider_visible=False, title=f"{ticker} — Interactive signal dashboard")
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Close'))
+fig.add_trace(go.Scatter(x=df.index, y=df['ema_fast'], name='EMA15'))
+fig.add_trace(go.Scatter(x=df.index, y=df['ema_slow'], name='EMA81'))
+bi = df.index[df['signal']==1]
+si = df.index[df['signal']==-1]
+fig.add_trace(go.Scatter(x=bi, y=df.loc[bi,'close'], mode='markers', marker=dict(symbol='triangle-up', size=9), name='Buy pts'))
+fig.add_trace(go.Scatter(x=si, y=df.loc[si,'close'], mode='markers', marker=dict(symbol='triangle-down', size=9), name='Sell pts'))
+fig.update_layout(height=520, title=f'{ticker} Auto Signals')
 st.plotly_chart(fig, use_container_width=True)
-
-st.subheader("How to use")
-st.markdown(
-    """
-1. Pick asset/timeframe in sidebar.
-2. Tune RSI/volatility thresholds.
-3. Follow **Signal now** + markers.
-4. Validate with paper trading before any real money.
-
-**Rule of thumb:**
-- Buy when green setup appears with rising EMAs.
-- Sell/short when red setup appears with falling EMAs.
-- Skip when yellow (no edge).
-"""
-)
