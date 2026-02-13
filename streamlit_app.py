@@ -12,9 +12,16 @@ st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
 st.caption("Auto-tuned thresholds + evidence panels. Educational use only. Supports 1m to 1d intervals.")
 
 with st.sidebar:
-    ticker = st.selectbox("Asset", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "NFLX", "SPY", "QQQ", "GLD", "EURUSD=X", "JPY=X"], index=0)
+    ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
+    use_custom_dates = st.checkbox("Use custom date range", value=False)
+    if use_custom_dates:
+        start_date = st.date_input("Start date", value=pd.to_datetime("2024-01-01"))
+        end_date = st.date_input("End date", value=pd.Timestamp.today().date())
+    else:
+        start_date = None
+        end_date = None
 
 
 STATUS_PATH = Path(__file__).with_name("bot_status.json")
@@ -72,8 +79,11 @@ if interval == "1m" and period in ["2y", "5y", "1y"]:
     period = "7d"
 elif interval in ["5m", "15m", "30m"] and period in ["2y", "5y"]:
     period = "60d"
-def load_data(symbol, period, interval):
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+def load_data(symbol, period, interval, start_date=None, end_date=None):
+    if start_date is not None and end_date is not None:
+        df = yf.download(symbol, start=str(start_date), end=str(end_date), interval=interval, auto_adjust=True, progress=False)
+    else:
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     return df.rename(columns=str.lower).dropna()
@@ -158,7 +168,7 @@ if STATUS_PATH.exists():
 else:
     st.sidebar.info("Bot is starting… status will appear soon.")
 
-raw = load_data(ticker, period, interval)
+raw = load_data(ticker, period, interval, start_date, end_date)
 if raw is None or raw.empty:
     st.error("No data returned for this asset/interval. Try a larger period or different interval.")
     st.stop()
