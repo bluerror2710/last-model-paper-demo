@@ -16,13 +16,15 @@ with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
-    cooldown_bars = st.slider("Cooldown bars", 0, 20, 3)
-    max_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
     portfolio_mode = st.checkbox("Portfolio mode (top 5 assets)", value=True)
     portfolio_top_n = 5
-    fee_bps = st.slider("Fee (bps)", 0.0, 20.0, 5.0, 0.5)
-    slippage_bps = st.slider("Slippage (bps)", 0.0, 30.0, 8.0, 0.5)
-    use_news_blackout = st.checkbox("Use news blackout", value=True)
+
+# auto-found controls (set later by model)
+cooldown_bars = 3
+max_risk_pct = 0.01
+fee_bps = 5.0
+slippage_bps = 8.0
+use_news_blackout = True
 
 
 
@@ -63,7 +65,8 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
         try:
             d = add_features(load_data(symbol, period, interval), interval)
             sh, rb, rs, vm, _, _, _, _ = auto_tune(d)
-            _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm)
+            ctl = auto_controls(d, rb, rs, vm)
+            _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm, cooldown=ctl["cooldown"], fee=ctl["fee"], slippage=ctl["slippage"], news_blackout=ctl["news"])
             d["signal"] = sig_live
             i = len(d)-1
             s_now = int(d["signal"].iloc[i])
@@ -74,7 +77,7 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
 
             if pos != 0 and s_now == -pos:
                 vol_now = float(last.get("vol", 0.01)) if pd.notna(last.get("vol", 0.01)) else 0.01
-                dyn_risk = max(0.002, min(max_risk_pct, 0.01 / max(vol_now, 1e-6)))
+                dyn_risk = max(0.002, min(ctl["risk"], 0.01 / max(vol_now, 1e-6)))
                 pnl = (price - entry) / entry * pos * (capital * dyn_risk * 5)
                 capital += pnl
                 trades.append(pnl)
@@ -91,7 +94,8 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
                 "symbol": symbol,
                 "capital": round(capital, 2),
                 "cum_pnl": round(cum_pnl, 2),
-                "cum_pct": round(cum_pct, 2)
+                "cum_pct": round(cum_pct, 2),
+                "controls": ctl
             }
             status_path.write_text(json.dumps(status, indent=2))
         except Exception as e:
@@ -105,6 +109,7 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
     capital = start_capital
     positions = {}
     entries = {}
+    asset_pnl = {}
     while True:
         try:
             rows = []
@@ -114,7 +119,8 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
                     if d is None or d.empty or len(d) < 120:
                         continue
                     sh, rb, rs, vm, *_ = auto_tune(d)
-                    _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm)
+                    ctl = auto_controls(d, rb, rs, vm)
+                    _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm, cooldown=ctl["cooldown"], fee=ctl["fee"], slippage=ctl["slippage"], news_blackout=ctl["news"])
                     s_now = int(sig_live.iloc[-1])
                     px = float(d['close'].iloc[-1])
                     rows.append((a, sh, s_now, px))
@@ -124,7 +130,8 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
             if rows:
                 top = sorted(rows, key=lambda x: x[1], reverse=True)[:5]
                 active = [r for r in top if r[2] != 0]
-                alloc = (capital * max_risk_pct * 5 / max(1, len(active)))
+                avg_risk = np.mean([0.01 for _ in active]) if active else 0.01
+                alloc = (capital * avg_risk * 5 / max(1, len(active)))
 
                 # close positions not in active or flipped
                 for a in list(positions.keys()):
@@ -133,6 +140,7 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
                         px = row[3] if row else entries[a]
                         pnl = (px - entries[a]) / entries[a] * positions[a] * alloc
                         capital += pnl
+                        asset_pnl[a] = asset_pnl.get(a, 0.0) + pnl
                         positions.pop(a, None)
                         entries.pop(a, None)
 
@@ -149,6 +157,8 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
                 "cum_pnl": round(capital - start_capital, 2),
                 "cum_pct": round((capital / start_capital - 1) * 100, 2),
                 "active_positions": len(positions),
+                "weights": {a: round(1/max(1,len(positions)),3) for a in positions.keys()},
+                "asset_pnl": {k: round(v,2) for k,v in asset_pnl.items()}
             }
             status_path.write_text(json.dumps(status, indent=2))
         except Exception as e:
@@ -214,7 +224,7 @@ def add_features(df, interval):
     return df.dropna()
 
 
-def score(df, rsi_buy, rsi_sell, vol_min):
+def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, news_blackout=True):
     # Base trend signal
     trend_sig = pd.Series(0, index=df.index)
     trend_sig[(df["ema_fast"] > df["ema_slow"]) & (df["rsi"] > rsi_buy) & (df["vol"] > vol_min)] = 1
@@ -245,16 +255,16 @@ def score(df, rsi_buy, rsi_sell, vol_min):
     sig = sig.where(df["trend_spread"].abs() > 0.0015, 0)
 
     # Optional news blackout + execution realism controls from sidebar
-    if use_news_blackout:
+    if news_blackout:
         sig = sig.where(~blackout_mask(df.index), 0)
 
     # Cooldown to reduce overtrading
-    if cooldown_bars > 0:
+    if cooldown > 0:
         vals = sig.values.copy()
         last_trade = -10**9
         for i in range(len(vals)):
             if vals[i] != 0:
-                if i - last_trade <= cooldown_bars:
+                if i - last_trade <= cooldown:
                     vals[i] = 0
                 else:
                     last_trade = i
@@ -265,7 +275,7 @@ def score(df, rsi_buy, rsi_sell, vol_min):
     pos = sig.replace(0, np.nan).ffill().fillna(0)
     gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
     turnover = pos.diff().abs().fillna(0)
-    cost = turnover * ((fee_bps + slippage_bps) / 10000.0)
+    cost = turnover * ((fee + slippage) / 10000.0)
     sret = gross - cost
 
     equity = (1 + sret).cumprod()
@@ -292,6 +302,21 @@ def auto_tune(df):
     return best
 
 
+
+
+def auto_controls(df, rb, rs, vm):
+    best = (-1e9, 3, 0.01, 5.0, 8.0, True)
+    for cd in [1, 3, 5]:
+        for risk in [0.007, 0.01, 0.015]:
+            for fee in [3.0, 5.0, 8.0]:
+                for slip in [5.0, 8.0, 12.0]:
+                    for nb in [False, True]:
+                        sh, *_ = score(df.copy(), rb, rs, vm, cooldown=cd, fee=fee, slippage=slip, news_blackout=nb)
+                        # penalize expensive setup a bit
+                        obj = sh - (fee + slip) * 0.01
+                        if obj > best[0]:
+                            best = (obj, cd, risk, fee, slip, nb)
+    return {"cooldown": best[1], "risk": best[2], "fee": best[3], "slippage": best[4], "news": best[5]}
 start_embedded_bot(ticker, period, interval)
 STATUS_PATH = Path(st.session_state.get("bot_status_path", str(_status_path(ticker, interval))))
 
@@ -336,8 +361,15 @@ if sig is None or len(sig) == 0:
     st.error("Auto-tuning failed due to insufficient data.")
     st.stop()
 
+ctl = auto_controls(df, rb, rs, vm)
+cooldown_bars = ctl["cooldown"]
+max_risk_pct = ctl["risk"]
+fee_bps = ctl["fee"]
+slippage_bps = ctl["slippage"]
+use_news_blackout = ctl["news"]
+
 # Full pipeline score uses all configured options (ensemble, MTF, costs, blackout, cooldown)
-_, sig_full, sret, equity, dd = score(df.copy(), rb, rs, vm)
+_, sig_full, sret, equity, dd = score(df.copy(), rb, rs, vm, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
 
 df["signal"] = sig_full
 df["strategy_ret"] = sret
@@ -366,7 +398,7 @@ reasons = {
 }
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Ensemble model active | Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Base score={sh:.2f}")
+st.caption(f"Ensemble active | Auto params: RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
 
 if STATUS_PATH.exists():
     try:
@@ -375,6 +407,26 @@ if STATUS_PATH.exists():
     except Exception:
         pass
 
+
+if portfolio_mode and STATUS_PATH.exists():
+    try:
+        bs = json.loads(STATUS_PATH.read_text())
+        ap = bs.get("asset_pnl", {})
+        wt = bs.get("weights", {})
+        if ap:
+            st.subheader("Portfolio redistribution & P/L by asset")
+            cA, cB = st.columns(2)
+            with cA:
+                figp = go.Figure(go.Bar(x=list(ap.keys()), y=list(ap.values()), name="P/L EUR"))
+                figp.update_layout(height=320, title="Profit/Loss by asset")
+                st.plotly_chart(figp, use_container_width=True)
+            with cB:
+                if wt:
+                    figw = go.Figure(go.Pie(labels=list(wt.keys()), values=list(wt.values()), hole=0.45))
+                    figw.update_layout(height=320, title="Current redistribution weights")
+                    st.plotly_chart(figw, use_container_width=True)
+    except Exception:
+        pass
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Price", f"{latest['close']:.2f}")
 c2.metric("Proxy return", f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
@@ -397,7 +449,7 @@ if len(df) > 200:
     test_df = df.iloc[split_idx:].copy()
 
     sh_t, rb_t, rs_t, vm_t, *_ = auto_tune(train_df)
-    _, sig_test, sret_test, eq_test, dd_test = score(test_df.copy(), rb_t, rs_t, vm_t)
+    _, sig_test, sret_test, eq_test, dd_test = score(test_df.copy(), rb_t, rs_t, vm_t, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
     test_df['sig_test'] = sig_test
     test_df['eq_test'] = eq_test
     test_df['dd_test'] = dd_test
@@ -447,7 +499,7 @@ for start in range(max(60, chunk), len(df)-chunk, chunk):
     if len(tr) < 80 or len(te) < 20:
         continue
     shw, rbw, rsw, vmw, *_ = auto_tune(tr)
-    _, _, sret_w, eq_w, dd_w = score(te, rbw, rsw, vmw)
+    _, _, sret_w, eq_w, dd_w = score(te, rbw, rsw, vmw, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
     wf_scores.append((eq_w.iloc[-1]-1)*100)
     wf_folds += 1
 if wf_folds:
