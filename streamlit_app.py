@@ -10,7 +10,7 @@ st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
 st.caption("Auto-tuned thresholds + evidence panels. Educational use only.")
 
 with st.sidebar:
-    ticker = st.selectbox("Asset", ["BTC-USD", "AAPL", "TSLA", "ETH-USD", "MSFT", "NVDA"], index=0)
+    ticker = st.selectbox("Asset", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "NFLX", "SPY", "QQQ", "GLD", "EURUSD=X", "JPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1h", "4h", "1d"], index=0)
 
@@ -111,6 +111,41 @@ c4.metric("Hit ratio", f"{(df['strategy_ret']>0).mean()*100:.1f}%")
 with st.expander("Why this signal?"):
     st.write(reasons)
 
+# simple paper bot simulation (no real money)
+start_cap = st.sidebar.number_input("Paper start capital", min_value=100.0, value=10000.0, step=100.0)
+risk_per_trade = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
+
+pos = 0
+entry = 0.0
+capital = start_cap
+curve = []
+trades = []
+for i in range(1, len(df)):
+    px = float(df["close"].iloc[i])
+    sig_i = int(df["signal"].iloc[i])
+    # close/open logic
+    if pos != 0 and sig_i == -pos:
+        pnl = (px - entry) / entry * pos * (capital * risk_per_trade * 5)
+        capital += pnl
+        trades.append(pnl)
+        pos = 0
+    if pos == 0 and sig_i != 0:
+        pos = sig_i
+        entry = px
+    curve.append(capital)
+
+if len(curve) == 0:
+    curve = [start_cap]
+curve = pd.Series(curve, index=df.index[1:1+len(curve)])
+paper_dd = curve / curve.cummax() - 1
+paper_ret = (curve.iloc[-1] / start_cap - 1) * 100
+win_rate = (np.array(trades) > 0).mean() * 100 if trades else 0.0
+
+pc1,pc2,pc3 = st.columns(3)
+pc1.metric("Paper bot return", f"{paper_ret:.2f}%")
+pc2.metric("Paper bot max DD", f"{paper_dd.min()*100:.2f}%")
+pc3.metric("Paper bot win rate", f"{win_rate:.1f}%")
+
 # tabs
 T1, T2, T3, T4, T5 = st.tabs(["Price & Signals", "Performance", "Risk", "Distributions", "Live Safety"])
 
@@ -130,10 +165,11 @@ with T1:
     st.plotly_chart(fig, use_container_width=True)
 
 with T2:
-    fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06)
+    fig2 = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5,0.25,0.25])
     fig2.add_trace(go.Scatter(x=df.index, y=df["equity"], name="Equity"), row=1, col=1)
     fig2.add_trace(go.Scatter(x=df.index, y=(1 + df["ret"].fillna(0)).cumprod(), name="Buy&Hold"), row=1, col=1)
     fig2.add_trace(go.Bar(x=df.index, y=df["strategy_ret"], name="Strategy returns"), row=2, col=1)
+    fig2.add_trace(go.Scatter(x=curve.index, y=curve.values, name="Paper bot equity"), row=3, col=1)
     fig2.update_layout(height=700)
     st.plotly_chart(fig2, use_container_width=True)
 
