@@ -26,8 +26,8 @@ with st.sidebar:
 # auto-found controls (set later by model)
 cooldown_bars = 3
 max_risk_pct = 0.01
-fee_bps = 5.0
-slippage_bps = 8.0
+fee_bps = 0.0
+slippage_bps = 0.0
 use_news_blackout = True
 AI_ENABLED = False
 
@@ -305,8 +305,7 @@ def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, new
     pos = sig.replace(0, np.nan).ffill().fillna(0)
     gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
     turnover = pos.diff().abs().fillna(0)
-    cost = turnover * ((fee + slippage) / 10000.0)
-    sret = gross - cost
+    sret = gross
 
     equity = (1 + sret).cumprod()
     dd = equity / equity.cummax() - 1
@@ -335,21 +334,18 @@ def auto_tune(df):
 
 
 def auto_controls(df, rb, rs, vm):
-    best = (-1e9, 3, 0.01, 5.0, 8.0, True)
+    best = (-1e9, 3, 0.01, True)
     vol_med = float(df["vol"].median()) if "vol" in df else 0.005
     fee_cands = [max(1.0, round(vol_med*12000,1)), 3.0, 5.0, 8.0]
     slip_cands = [max(2.0, round(vol_med*18000,1)), 5.0, 8.0, 12.0]
     for cd in [1, 2, 3, 5]:
         for risk in [0.005, 0.007, 0.01, 0.015]:
-            for fee in sorted(set(fee_cands)):
-                for slip in sorted(set(slip_cands)):
-                    for nb in [False, True]:
-                        sh, *_ = score(df.copy(), rb, rs, vm, cooldown=cd, fee=fee, slippage=slip, news_blackout=nb)
-                        # penalize expensive setup a bit
-                        obj = sh - (fee + slip) * 0.01
-                        if obj > best[0]:
-                            best = (obj, cd, risk, fee, slip, nb)
-    return {"cooldown": best[1], "risk": best[2], "fee": best[3], "slippage": best[4], "news": best[5]}
+            for nb in [False, True]:
+                sh, *_ = score(df.copy(), rb, rs, vm, cooldown=cd, fee=0.0, slippage=0.0, news_blackout=nb)
+                obj = sh
+                if obj > best[0]:
+                    best = (obj, cd, risk, nb)
+    return {"cooldown": best[1], "risk": best[2], "fee": 0.0, "slippage": 0.0, "news": best[3]}
 
 
 def run_reliability(df, rb, rs, vm):
@@ -501,7 +497,7 @@ if page == "Reliability":
     st.stop()
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"{'Manual' if manual_controls else 'Auto'} controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
+st.caption(f"{'Manual' if manual_controls else 'Auto'} controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, blackout={use_news_blackout}")
 
 if STATUS_PATH.exists():
     try:
