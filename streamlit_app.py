@@ -182,7 +182,35 @@ if sig is None or len(sig) == 0:
     st.error("Auto-tuning failed due to insufficient data.")
     st.stop()
 
-df["signal"] = sig
+# Ensemble (trend + mean-reversion + breakout)
+trend_sig = sig.copy()
+mr_sig = pd.Series(0, index=df.index)
+mr_sig[(df["rsi"] < 30) & (df["ema_fast"] > df["ema_slow"])] = 1
+mr_sig[(df["rsi"] > 70) & (df["ema_fast"] < df["ema_slow"])] = -1
+roll_hi = df["close"].rolling(20).max().shift(1)
+roll_lo = df["close"].rolling(20).min().shift(1)
+br_sig = pd.Series(0, index=df.index)
+br_sig[df["close"] > roll_hi] = 1
+br_sig[df["close"] < roll_lo] = -1
+
+vote = trend_sig + mr_sig + br_sig
+ens_sig = pd.Series(0, index=df.index)
+ens_sig[vote >= 2] = 1
+ens_sig[vote <= -2] = -1
+
+# fallback to trend signal when ensemble has no vote
+ens_sig = ens_sig.where(ens_sig != 0, trend_sig)
+
+# risk filter: ignore weak volatility regimes
+ens_sig = ens_sig.where(df["vol"] > max(vm*0.8, 0.001), 0)
+
+# compute returns from ensemble
+pos = ens_sig.replace(0, np.nan).ffill().fillna(0)
+sret = pos.shift(1).fillna(0) * df["ret"].fillna(0)
+equity = (1 + sret).cumprod()
+dd = equity / equity.cummax() - 1
+
+df["signal"] = ens_sig
 df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
@@ -209,7 +237,7 @@ reasons = {
 }
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Score(Sharpe)={sh:.2f}")
+st.caption(f"Ensemble model active | Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Base score={sh:.2f}")
 
 if STATUS_PATH.exists():
     try:
@@ -226,6 +254,10 @@ c4.metric("Signal activity", f"{(df["signal"]!=0).mean()*100:.1f}%")
 
 with st.expander("Why this signal?"):
     st.write(reasons)
+
+# hard risk line for paper safety
+if df["drawdown"].min() < -0.06:
+    st.warning("Risk guard: drawdown exceeded 6% in this backtest slice.")
 
 
 # Fixed reliability test:
