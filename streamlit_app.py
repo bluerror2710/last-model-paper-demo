@@ -19,6 +19,9 @@ with st.sidebar:
     portfolio_mode = st.checkbox("Portfolio mode (top 5 assets)", value=True)
     portfolio_top_n = 5
     page = st.radio("Page", ["Main", "Reliability"], index=0)
+    manual_controls = st.checkbox("Manual controls", value=True)
+    manual_cooldown = st.slider("Cooldown bars", 0, 20, 3)
+    manual_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
 
 # auto-found controls (set later by model)
 cooldown_bars = 3
@@ -445,6 +448,9 @@ max_risk_pct = ctl["risk"]
 fee_bps = ctl["fee"]
 slippage_bps = ctl["slippage"]
 use_news_blackout = ctl["news"]
+if manual_controls:
+    cooldown_bars = manual_cooldown
+    max_risk_pct = manual_risk_pct
 
 # Full pipeline score uses all configured options (ensemble, MTF, costs, blackout, cooldown)
 _, sig_full, sret, equity, dd = score(df.copy(), rb, rs, vm, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
@@ -495,7 +501,7 @@ if page == "Reliability":
     st.stop()
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Auto controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
+st.caption(f"{'Manual' if manual_controls else 'Auto'} controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
 
 if STATUS_PATH.exists():
     try:
