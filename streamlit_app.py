@@ -9,12 +9,12 @@ from pathlib import Path
 
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
 st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
-st.caption("Auto-tuned thresholds + evidence panels. Educational use only.")
+st.caption("Auto-tuned thresholds + evidence panels. Educational use only. Supports 1m to 1d intervals.")
 
 with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "NFLX", "SPY", "QQQ", "GLD", "EURUSD=X", "JPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
-    interval = st.selectbox("Interval", ["1h", "4h", "1d"], index=0)
+    interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
 
 
 STATUS_PATH = Path(__file__).with_name("bot_status.json")
@@ -55,7 +55,8 @@ def _bot_loop(symbol: str, period: str, interval: str, start_capital: float = 10
         except Exception as e:
             STATUS_PATH.write_text(json.dumps({"error": str(e), "symbol": symbol}, indent=2))
 
-        sleep_sec = 300 if interval == "1h" else (900 if interval == "4h" else 3600)
+        sleep_map = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+        sleep_sec = sleep_map.get(interval, 300)
         time.sleep(sleep_sec)
 
 @st.cache_resource
@@ -65,6 +66,12 @@ def start_embedded_bot(symbol: str, period: str, interval: str):
     return True
 
 
+
+# adjust period for Yahoo intraday limits
+if interval == "1m" and period in ["2y", "5y", "1y"]:
+    period = "7d"
+elif interval in ["5m", "15m", "30m"] and period in ["2y", "5y"]:
+    period = "60d"
 def load_data(symbol, period, interval):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
@@ -84,7 +91,7 @@ def add_features(df, interval):
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df["ret"] = c.pct_change()
-    win = 24 if interval in ["1h", "4h"] else 14
+    win = 24 if interval in ["1h", "4h"] else (60 if interval in ["1m", "5m", "15m", "30m"] else 14)
     df["vol"] = df["ret"].rolling(win).std()
     df["trend_spread"] = (df["ema_fast"] - df["ema_slow"]) / df["close"]
 
