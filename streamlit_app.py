@@ -158,13 +158,29 @@ if STATUS_PATH.exists():
 else:
     st.sidebar.info("Bot is starting… status will appear soon.")
 
-df = add_features(load_data(ticker, period, interval), interval)
+raw = load_data(ticker, period, interval)
+if raw is None or raw.empty:
+    st.error("No data returned for this asset/interval. Try a larger period or different interval.")
+    st.stop()
+
+df = add_features(raw, interval)
+if df is None or df.empty:
+    st.error("Not enough data after feature engineering. Try another interval/period.")
+    st.stop()
+
 sh, rb, rs, vm, sig, sret, equity, dd = auto_tune(df)
+if sig is None or len(sig) == 0:
+    st.error("Auto-tuning failed due to insufficient data.")
+    st.stop()
 
 df["signal"] = sig
 df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
+
+if df.empty:
+    st.error("Dataset is empty after processing.")
+    st.stop()
 
 latest = df.iloc[-1]
 sig_now = int(latest["signal"])
