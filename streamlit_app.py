@@ -3,10 +3,11 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Auto Signal", layout="wide")
-st.title("🤖 Auto Buy / Hold / Sell")
-st.caption("Thresholds are auto-found from recent data.")
+st.set_page_config(page_title="Auto Signal Pro", layout="wide")
+st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
+st.caption("Auto-tuned thresholds + evidence panels. Educational use only.")
 
 with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-USD", "AAPL", "TSLA", "ETH-USD", "MSFT", "NVDA"], index=0)
@@ -21,78 +22,139 @@ def load_data(symbol, period, interval):
     return df.rename(columns=str.lower).dropna()
 
 
-def add_features(df):
-    c = df['close']
-    df['ema_fast'] = c.ewm(span=15, adjust=False).mean()
-    df['ema_slow'] = c.ewm(span=81, adjust=False).mean()
+def add_features(df, interval):
+    c = df["close"]
+    df["ema_fast"] = c.ewm(span=15, adjust=False).mean()
+    df["ema_slow"] = c.ewm(span=81, adjust=False).mean()
+
     d = c.diff()
     gain = d.clip(lower=0).rolling(14).mean()
     loss = (-d.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    df['ret'] = c.pct_change()
-    win = 24 if interval in ['1h', '4h'] else 14
-    df['vol'] = df['ret'].rolling(win).std()
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    df["ret"] = c.pct_change()
+    win = 24 if interval in ["1h", "4h"] else 14
+    df["vol"] = df["ret"].rolling(win).std()
+    df["trend_spread"] = (df["ema_fast"] - df["ema_slow"]) / df["close"]
+
     return df.dropna()
 
 
 def score(df, rsi_buy, rsi_sell, vol_min):
-    long_sig = (df['ema_fast'] > df['ema_slow']) & (df['rsi'] > rsi_buy) & (df['vol'] > vol_min)
-    short_sig = (df['ema_fast'] < df['ema_slow']) & (df['rsi'] < rsi_sell) & (df['vol'] > vol_min)
+    long_sig = (df["ema_fast"] > df["ema_slow"]) & (df["rsi"] > rsi_buy) & (df["vol"] > vol_min)
+    short_sig = (df["ema_fast"] < df["ema_slow"]) & (df["rsi"] < rsi_sell) & (df["vol"] > vol_min)
+
     sig = pd.Series(0, index=df.index)
     sig[long_sig] = 1
     sig[short_sig] = -1
+
     pos = sig.replace(0, np.nan).ffill().fillna(0)
-    sret = pos.shift(1).fillna(0) * df['ret'].fillna(0)
+    sret = pos.shift(1).fillna(0) * df["ret"].fillna(0)
+    equity = (1 + sret).cumprod()
+    dd = equity / equity.cummax() - 1
+
     if sret.std() == 0:
-        return -999, sig, sret
-    sharpe = (sret.mean() / sret.std()) * np.sqrt(252)
-    return float(sharpe), sig, sret
+        sharpe = -999
+    else:
+        sharpe = float((sret.mean() / sret.std()) * np.sqrt(252))
+
+    return sharpe, sig, sret, equity, dd
 
 
 def auto_tune(df):
-    best = (-999, 65, 35, 0.003, None, None)
+    best = (-999, 65, 35, 0.003, None, None, None, None)
     for rb in [55, 60, 65, 70]:
         for rs in [30, 35, 40, 45]:
             if rs >= rb:
                 continue
             for vm in [0.001, 0.002, 0.003, 0.004, 0.006]:
-                sc, sig, sret = score(df, rb, rs, vm)
-                if sc > best[0]:
-                    best = (sc, rb, rs, vm, sig, sret)
+                sh, sig, sret, eq, dd = score(df, rb, rs, vm)
+                if sh > best[0]:
+                    best = (sh, rb, rs, vm, sig, sret, eq, dd)
     return best
 
 
-df = add_features(load_data(ticker, period, interval))
-sh, rb, rs, vm, sig, sret = auto_tune(df)
-df['signal'] = sig
-df['equity'] = (1 + sret).cumprod()
+df = add_features(load_data(ticker, period, interval), interval)
+sh, rb, rs, vm, sig, sret, equity, dd = auto_tune(df)
 
-now = int(df['signal'].iloc[-1])
-label = 'HOLD'
-color = 'orange'
-if now == 1:
-    label = 'BUY'
-    color = 'green'
-elif now == -1:
-    label = 'SELL'
-    color = 'red'
+df["signal"] = sig
+df["strategy_ret"] = sret
+df["equity"] = equity
+df["drawdown"] = dd
 
-st.markdown(f"## Signal now: :{color}[**{label}**]")
-st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | score={sh:.2f}")
+latest = df.iloc[-1]
+sig_now = int(latest["signal"])
+if sig_now == 1:
+    decision, color = "BUY", "green"
+elif sig_now == -1:
+    decision, color = "SELL", "red"
+else:
+    decision, color = "HOLD", "orange"
 
-c1,c2,c3 = st.columns(3)
-c1.metric('Price', f"{df['close'].iloc[-1]:.2f}")
-c2.metric('Proxy return', f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
-c3.metric('Last RSI', f"{df['rsi'].iloc[-1]:.1f}")
+# reason breakdown
+reasons = {
+    "Trend": "UP" if latest["ema_fast"] > latest["ema_slow"] else "DOWN",
+    "RSI": f"{latest['rsi']:.1f} (buy>{rb} / sell<{rs})",
+    "Volatility": f"{latest['vol']:.4f} (min>{vm:.3f})",
+}
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Close'))
-fig.add_trace(go.Scatter(x=df.index, y=df['ema_fast'], name='EMA15'))
-fig.add_trace(go.Scatter(x=df.index, y=df['ema_slow'], name='EMA81'))
-bi = df.index[df['signal']==1]
-si = df.index[df['signal']==-1]
-fig.add_trace(go.Scatter(x=bi, y=df.loc[bi,'close'], mode='markers', marker=dict(symbol='triangle-up', size=9), name='Buy pts'))
-fig.add_trace(go.Scatter(x=si, y=df.loc[si,'close'], mode='markers', marker=dict(symbol='triangle-down', size=9), name='Sell pts'))
-fig.update_layout(height=520, title=f'{ticker} Auto Signals')
-st.plotly_chart(fig, use_container_width=True)
+st.markdown(f"## Signal now: :{color}[**{decision}**]")
+st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Score(Sharpe)={sh:.2f}")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Price", f"{latest['close']:.2f}")
+c2.metric("Proxy return", f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
+c3.metric("Max drawdown", f"{df['drawdown'].min()*100:.2f}%")
+c4.metric("Hit ratio", f"{(df['strategy_ret']>0).mean()*100:.1f}%")
+
+with st.expander("Why this signal?"):
+    st.write(reasons)
+
+# tabs
+T1, T2, T3, T4 = st.tabs(["Price & Signals", "Performance", "Risk", "Distributions"])
+
+with T1:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
+    fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["ema_fast"], name="EMA15", line=dict(width=1.1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["ema_slow"], name="EMA81", line=dict(width=1.1)), row=1, col=1)
+    bi = df.index[df["signal"] == 1]
+    si = df.index[df["signal"] == -1]
+    fig.add_trace(go.Scatter(x=bi, y=df.loc[bi, "close"], mode="markers", marker=dict(symbol="triangle-up", size=8), name="Buy"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=si, y=df.loc[si, "close"], mode="markers", marker=dict(symbol="triangle-down", size=8), name="Sell"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["rsi"], name="RSI", line=dict(width=1.1)), row=2, col=1)
+    fig.add_hline(y=rb, line_dash="dot", row=2, col=1)
+    fig.add_hline(y=rs, line_dash="dot", row=2, col=1)
+    fig.update_layout(height=820, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+with T2:
+    fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06)
+    fig2.add_trace(go.Scatter(x=df.index, y=df["equity"], name="Equity"), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=df.index, y=(1 + df["ret"].fillna(0)).cumprod(), name="Buy&Hold"), row=1, col=1)
+    fig2.add_trace(go.Bar(x=df.index, y=df["strategy_ret"], name="Strategy returns"), row=2, col=1)
+    fig2.update_layout(height=700)
+    st.plotly_chart(fig2, use_container_width=True)
+
+with T3:
+    rolling_sharpe = (df["strategy_ret"].rolling(80).mean() / df["strategy_ret"].rolling(80).std()) * np.sqrt(252)
+    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True)
+    fig3.add_trace(go.Scatter(x=df.index, y=df["drawdown"], name="Drawdown"), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=df.index, y=rolling_sharpe, name="Rolling Sharpe(80)"), row=2, col=1)
+    fig3.update_layout(height=650)
+    st.plotly_chart(fig3, use_container_width=True)
+
+with T4:
+    hist = np.histogram(df["strategy_ret"].dropna(), bins=60)
+    fig4 = go.Figure()
+    fig4.add_trace(go.Bar(x=hist[1][:-1], y=hist[0], name="Return histogram"))
+    fig4.update_layout(height=360, title="Strategy return distribution")
+    st.plotly_chart(fig4, use_container_width=True)
+
+    by_signal = df.groupby("signal")["ret"].mean().rename({-1: "sell", 0: "hold", 1: "buy"})
+    st.write("Average next-period return by signal:")
+    st.dataframe(by_signal.to_frame("avg_return"))
+
+st.markdown("### Quick interpretation")
+st.markdown("- **BUY**: trend up + RSI strong + volatility active.\n- **SELL**: trend down + RSI weak + volatility active.\n- **HOLD**: conditions mixed or weak edge.")
