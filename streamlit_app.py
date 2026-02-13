@@ -9,12 +9,14 @@ from pathlib import Path
 
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
 st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
-st.caption("Auto-tuned thresholds + evidence panels. Educational use only. Supports 1m to 1d intervals.")
+st.caption("Auto-tuned per asset/timeframe + ensemble + risk controls. Educational use only.")
 
 with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
+    cooldown_bars = st.slider("Cooldown bars", 0, 20, 3)
+    max_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
 
 
 def _status_path(symbol: str, interval: str) -> Path:
@@ -28,23 +30,31 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
     pos = 0
     entry = 0.0
     trades = []
+    last_trade_i = -10**9
     while True:
         try:
             d = add_features(load_data(symbol, period, interval), interval)
             sh, rb, rs, vm, sig, sret, eq, dd = auto_tune(d)
             d["signal"] = sig
+            # use latest with cooldown approximation
+            i = len(d)-1
+            s_now = int(d["signal"].iloc[i])
+            if cooldown_bars > 0 and (i - last_trade_i) <= cooldown_bars:
+                s_now = 0
             last = d.iloc[-1]
-            s_now = int(last["signal"])
             price = float(last["close"])
 
             if pos != 0 and s_now == -pos:
-                pnl = (price - entry) / entry * pos * (capital * 0.01 * 5)
+                vol_now = float(last.get("vol", 0.01)) if pd.notna(last.get("vol", 0.01)) else 0.01
+                dyn_risk = max(0.002, min(max_risk_pct, 0.01 / max(vol_now, 1e-6)))
+                pnl = (price - entry) / entry * pos * (capital * dyn_risk * 5)
                 capital += pnl
                 trades.append(pnl)
                 pos = 0
             if pos == 0 and s_now != 0:
                 pos = s_now
                 entry = price
+                last_trade_i = i
 
             cum_pnl = capital - start_capital
             cum_pct = (capital / start_capital - 1) * 100
@@ -203,6 +213,8 @@ ens_sig = ens_sig.where(ens_sig != 0, trend_sig)
 
 # risk filter: ignore weak volatility regimes
 ens_sig = ens_sig.where(df["vol"] > max(vm*0.8, 0.001), 0)
+# chop filter: require minimum trend spread
+ens_sig = ens_sig.where(df["trend_spread"].abs() > 0.0015, 0)
 
 # compute returns from ensemble
 pos = ens_sig.replace(0, np.nan).ffill().fillna(0)
@@ -211,6 +223,17 @@ equity = (1 + sret).cumprod()
 dd = equity / equity.cummax() - 1
 
 df["signal"] = ens_sig
+# cooldown to reduce overtrading
+if cooldown_bars > 0:
+    sig_vals = df["signal"].values.copy()
+    last_trade = -10**9
+    for i in range(len(sig_vals)):
+        if sig_vals[i] != 0:
+            if i - last_trade <= cooldown_bars:
+                sig_vals[i] = 0
+            else:
+                last_trade = i
+    df["signal"] = sig_vals
 df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
@@ -294,7 +317,7 @@ st.caption(f"Parameters for this reliability test: RSI buy>{rb_t}, RSI sell<{rs_
 
 # simple paper bot simulation (no real money)
 start_cap = st.sidebar.number_input("Paper start capital (EUR)", min_value=100.0, value=10000.0, step=100.0)
-risk_per_trade = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
+risk_per_trade = max_risk_pct
 
 pos = 0
 entry = 0.0
@@ -306,7 +329,9 @@ for i in range(1, len(df)):
     sig_i = int(df["signal"].iloc[i])
     # close/open logic
     if pos != 0 and sig_i == -pos:
-        pnl = (px - entry) / entry * pos * (capital * risk_per_trade * 5)
+        vol_now = float(df["vol"].iloc[i]) if not np.isnan(df["vol"].iloc[i]) else 0.01
+        dyn_risk = max(0.002, min(risk_per_trade, 0.01 / max(vol_now, 1e-6)))
+        pnl = (px - entry) / entry * pos * (capital * dyn_risk * 5)
         capital += pnl
         trades.append(pnl)
         pos = 0
