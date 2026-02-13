@@ -42,16 +42,14 @@ def _bot_loop(symbol: str, period: str, interval: str, start_capital: float = 10
                 pos = s_now
                 entry = price
 
+            cum_pnl = capital - start_capital
+            cum_pct = (capital / start_capital - 1) * 100
             status = {
                 "ts": str(d.index[-1]),
                 "symbol": symbol,
-                "price": price,
-                "signal": "BUY" if s_now==1 else ("SELL" if s_now==-1 else "HOLD"),
                 "capital": round(capital, 2),
-                "position": "LONG" if pos==1 else ("SHORT" if pos==-1 else "FLAT"),
-                "trades": len(trades),
-                "win_rate": round((np.mean(np.array(trades)>0)*100) if trades else 0.0, 2),
-                "params": {"rsi_buy": rb, "rsi_sell": rs, "vol_min": vm, "score": round(sh,3)}
+                "cum_pnl": round(cum_pnl, 2),
+                "cum_pct": round(cum_pct, 2)
             }
             STATUS_PATH.write_text(json.dumps(status, indent=2))
         except Exception as e:
@@ -129,14 +127,29 @@ def auto_tune(df):
 
 start_embedded_bot(ticker, period, interval)
 
-# bot progress panel
+# bot progress panel (cumulative P/L only)
+st.sidebar.subheader("Bot Progress")
 if STATUS_PATH.exists():
     try:
-        st.sidebar.subheader("Bot Progress")
         bs = json.loads(STATUS_PATH.read_text())
-        st.sidebar.json(bs)
-    except Exception:
-        pass
+        cum_pnl = float(bs.get("cum_pnl", 0.0))
+        cum_pct = float(bs.get("cum_pct", 0.0))
+        capital = float(bs.get("capital", 10000.0))
+
+        st.sidebar.metric("Cumulative P/L", f"{cum_pnl:+.2f} USD", f"{cum_pct:+.2f}%")
+        st.sidebar.metric("Paper Capital", f"{capital:.2f} USD")
+
+        # Progress bar centered at 50% => 0% P/L, clipped at -20%..+20%
+        lo, hi = -20.0, 20.0
+        clipped = max(lo, min(hi, cum_pct))
+        progress = int(((clipped - lo) / (hi - lo)) * 100)
+        st.sidebar.progress(progress, text=f"P/L gauge ({lo:.0f}% to +{hi:.0f}%): {cum_pct:+.2f}%")
+
+        st.sidebar.caption("Bot runs inside Streamlit process (no separate runner needed).")
+    except Exception as e:
+        st.sidebar.warning(f"Bot status unavailable: {e}")
+else:
+    st.sidebar.info("Bot is starting… status will appear soon.")
 
 df = add_features(load_data(ticker, period, interval), interval)
 sh, rb, rs, vm, sig, sret, equity, dd = auto_tune(df)
@@ -164,6 +177,13 @@ reasons = {
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
 st.caption(f"Auto params → RSI buy>{rb}, RSI sell<{rs}, Vol min>{vm:.3f} | Score(Sharpe)={sh:.2f}")
+
+if STATUS_PATH.exists():
+    try:
+        bs = json.loads(STATUS_PATH.read_text())
+        st.info(f"Bot cumulative P/L: {float(bs.get('cum_pnl',0.0)):+.2f} USD ({float(bs.get('cum_pct',0.0)):+.2f}%)")
+    except Exception:
+        pass
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Price", f"{latest['close']:.2f}")
