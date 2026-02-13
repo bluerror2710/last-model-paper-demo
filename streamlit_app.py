@@ -17,9 +17,13 @@ with st.sidebar:
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
 
 
-STATUS_PATH = Path(__file__).with_name("bot_status.json")
+def _status_path(symbol: str, interval: str) -> Path:
+    safe = symbol.replace("/", "_").replace("=", "_").replace("-", "_")
+    return Path(__file__).with_name(f"bot_status_{safe}_{interval}.json")
 
-def _bot_loop(symbol: str, period: str, interval: str, start_capital: float = 10000.0):
+STATUS_PATH = _status_path(ticker, interval)
+
+def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_capital: float = 10000.0):
     capital = start_capital
     pos = 0
     entry = 0.0
@@ -51,18 +55,21 @@ def _bot_loop(symbol: str, period: str, interval: str, start_capital: float = 10
                 "cum_pnl": round(cum_pnl, 2),
                 "cum_pct": round(cum_pct, 2)
             }
-            STATUS_PATH.write_text(json.dumps(status, indent=2))
+            status_path.write_text(json.dumps(status, indent=2))
         except Exception as e:
-            STATUS_PATH.write_text(json.dumps({"error": str(e), "symbol": symbol}, indent=2))
+            status_path.write_text(json.dumps({"error": str(e), "symbol": symbol, "interval": interval}, indent=2))
 
         sleep_map = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
         sleep_sec = sleep_map.get(interval, 300)
         time.sleep(sleep_sec)
 
-@st.cache_resource
 def start_embedded_bot(symbol: str, period: str, interval: str):
-    t = threading.Thread(target=_bot_loop, args=(symbol, period, interval), daemon=True)
-    t.start()
+    key = f"{symbol}|{period}|{interval}"
+    if st.session_state.get("bot_key") != key:
+        st.session_state["bot_key"] = key
+        st.session_state["bot_status_path"] = str(_status_path(symbol, interval))
+        t = threading.Thread(target=_bot_loop, args=(symbol, period, interval, _status_path(symbol, interval)), daemon=True)
+        t.start()
     return True
 
 
@@ -133,6 +140,7 @@ def auto_tune(df):
 
 
 start_embedded_bot(ticker, period, interval)
+STATUS_PATH = Path(st.session_state.get("bot_status_path", str(_status_path(ticker, interval))))
 
 # bot progress panel (cumulative P/L only)
 st.sidebar.subheader("Bot Progress")
@@ -145,6 +153,7 @@ if STATUS_PATH.exists():
 
         st.sidebar.metric("Cumulative P/L", f"{cum_pnl:+.2f} EUR", f"{cum_pct:+.2f}%")
         st.sidebar.metric("Paper Capital", f"{capital:.2f} EUR")
+        st.sidebar.caption(f"Symbol/Interval: {ticker} / {interval}")
 
         # Progress bar centered at 50% => 0% P/L, clipped at -20%..+20%
         lo, hi = -20.0, 20.0
