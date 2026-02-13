@@ -18,6 +18,7 @@ with st.sidebar:
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
     portfolio_mode = st.checkbox("Portfolio mode (top 5 assets)", value=True)
     portfolio_top_n = 5
+    page = st.radio("Page", ["Main", "Reliability"], index=0)
 
 # auto-found controls (set later by model)
 cooldown_bars = 3
@@ -25,6 +26,7 @@ max_risk_pct = 0.01
 fee_bps = 5.0
 slippage_bps = 8.0
 use_news_blackout = True
+AI_ENABLED = (ticker == "BTC-EUR" and interval == "1h")
 
 
 
@@ -51,6 +53,8 @@ def blackout_mask(index):
 def ai_filter_signal(base_signal: int, row: pd.Series, context: dict):
     """Low-token Codex guardrail: returns (signal, risk_mult, reason)."""
     try:
+        if not AI_ENABLED:
+            return int(base_signal), 1.0, "ai_default_only"
         key = os.getenv("OPENAI_API_KEY", "")
         if not key:
             return int(base_signal), 1.0, "no_api_key"
@@ -251,6 +255,7 @@ if interval == "1m" and period in ["2y", "5y", "1y"]:
     period = "7d"
 elif interval in ["5m", "15m", "30m"] and period in ["2y", "5y"]:
     period = "60d"
+@st.cache_data(ttl=900, show_spinner=False)
 def load_data(symbol, period, interval):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
@@ -285,7 +290,7 @@ def add_features(df, interval):
     return df.dropna()
 
 
-def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, news_blackout=True):
+def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, news_blackout=True, ai_apply=False):
     # Base trend signal
     trend_sig = pd.Series(0, index=df.index)
     trend_sig[(df["ema_fast"] > df["ema_slow"]) & (df["rsi"] > rsi_buy) & (df["vol"] > vol_min)] = 1
@@ -331,8 +336,23 @@ def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, new
                     last_trade = i
         sig = pd.Series(vals, index=df.index)
 
+    # AI filter (low-token, optional)
+    if ai_apply and AI_ENABLED:
+        vals = sig.values.copy()
+        conf = np.ones(len(vals), dtype=float)
+        for i in range(len(vals)):
+            if vals[i] == 0:
+                continue
+            ai_sig, ai_rm, _ = ai_filter_signal(int(vals[i]), df.iloc[i], {"mode":"score"})
+            vals[i] = ai_sig
+            conf[i] = ai_rm
+        sig = pd.Series(vals, index=df.index)
+        ai_conf = pd.Series(conf, index=df.index)
+    else:
+        ai_conf = pd.Series(1.0, index=df.index)
+
     # Confidence sizing + costs
-    confidence = (vote.abs() / 3.0).clip(0.34, 1.0)
+    confidence = (vote.abs() / 3.0).clip(0.34, 1.0) * ai_conf
     pos = sig.replace(0, np.nan).ffill().fillna(0)
     gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
     turnover = pos.diff().abs().fillna(0)
@@ -367,10 +387,13 @@ def auto_tune(df):
 
 def auto_controls(df, rb, rs, vm):
     best = (-1e9, 3, 0.01, 5.0, 8.0, True)
-    for cd in [1, 3, 5]:
-        for risk in [0.007, 0.01, 0.015]:
-            for fee in [3.0, 5.0, 8.0]:
-                for slip in [5.0, 8.0, 12.0]:
+    vol_med = float(df["vol"].median()) if "vol" in df else 0.005
+    fee_cands = [max(1.0, round(vol_med*12000,1)), 3.0, 5.0, 8.0]
+    slip_cands = [max(2.0, round(vol_med*18000,1)), 5.0, 8.0, 12.0]
+    for cd in [1, 2, 3, 5]:
+        for risk in [0.005, 0.007, 0.01, 0.015]:
+            for fee in sorted(set(fee_cands)):
+                for slip in sorted(set(slip_cands)):
                     for nb in [False, True]:
                         sh, *_ = score(df.copy(), rb, rs, vm, cooldown=cd, fee=fee, slippage=slip, news_blackout=nb)
                         # penalize expensive setup a bit
@@ -378,6 +401,54 @@ def auto_controls(df, rb, rs, vm):
                         if obj > best[0]:
                             best = (obj, cd, risk, fee, slip, nb)
     return {"cooldown": best[1], "risk": best[2], "fee": best[3], "slippage": best[4], "news": best[5]}
+
+
+def run_reliability(df, rb, rs, vm):
+    if len(df) <= 200:
+        return {"hit":0.0,"rel_return":0.0,"rel_dd":0.0,"rb":rb,"rs":rs,"vm":vm,"wf_folds":0,"wf_avg":0.0,"test_df":None}
+    split_idx = max(1, len(df) - max(30, len(df)//12))
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+    sh_t, rb_t, rs_t, vm_t, *_ = auto_tune(train_df)
+    _, sig_test, sret_test, eq_test, dd_test = score(test_df.copy(), rb_t, rs_t, vm_t, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout, ai_apply=True)
+    test_df['sig_test']=sig_test; test_df['eq_test']=eq_test; test_df['dd_test']=dd_test
+    m=test_df['sig_test']!=0
+    hit=float((((test_df['sig_test'].shift(1)*test_df['ret'])>0)&m).sum()/m.sum()*100) if m.any() else 0.0
+    rel_return=float((test_df['eq_test'].iloc[-1]-1)*100)
+    rel_dd=float(test_df['dd_test'].min()*100)
+    wf_folds=0; wf_scores=[]; chunk=max(30,len(df)//10)
+    for st_i in range(max(60,chunk), len(df)-chunk, chunk):
+        tr=df.iloc[:st_i].copy(); te=df.iloc[st_i:st_i+chunk].copy()
+        if len(tr)<80 or len(te)<20: continue
+        _, rbw, rsw, vmw, *_ = auto_tune(tr)
+        _, _, _, eq_w, _ = score(te.copy(), rbw, rsw, vmw, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout, ai_apply=True)
+        wf_scores.append((eq_w.iloc[-1]-1)*100); wf_folds+=1
+    wf_avg=float(np.mean(wf_scores)) if wf_scores else 0.0
+    return {"hit":hit,"rel_return":rel_return,"rel_dd":rel_dd,"rb":rb_t,"rs":rs_t,"vm":vm_t,"wf_folds":wf_folds,"wf_avg":wf_avg,"test_df":test_df}
+
+
+def render_portfolio_plots(status_path):
+    if not portfolio_mode or not status_path.exists():
+        return
+    try:
+        bs = json.loads(status_path.read_text())
+        ap = bs.get("asset_pnl", {})
+        wt = bs.get("weights", {})
+        if ap:
+            st.subheader("Portfolio redistribution & P/L by asset")
+            cA, cB = st.columns(2)
+            with cA:
+                figp = go.Figure(go.Bar(x=list(ap.keys()), y=list(ap.values()), name="P/L EUR"))
+                figp.update_layout(height=320, title="Profit/Loss by asset")
+                st.plotly_chart(figp, use_container_width=True)
+            with cB:
+                if wt:
+                    figw = go.Figure(go.Pie(labels=list(wt.keys()), values=list(wt.values()), hole=0.45))
+                    figw.update_layout(height=320, title="Current redistribution weights")
+                    st.plotly_chart(figw, use_container_width=True)
+    except Exception:
+        pass
+
 start_embedded_bot(ticker, period, interval)
 STATUS_PATH = Path(st.session_state.get("bot_status_path", str(_status_path(ticker, interval))))
 
@@ -442,6 +513,8 @@ if df.empty:
     st.error("Dataset is empty after processing.")
     st.stop()
 
+rel = run_reliability(df.copy(), rb, rs, vm)
+
 latest = df.iloc[-1]
 base_sig_now = int(latest["signal"])
 sig_now, ui_ai_risk_mult, ui_ai_reason = ai_filter_signal(base_sig_now, latest, {"mode":"ui_decision"})
@@ -459,8 +532,24 @@ reasons = {
     "Volatility": f"{latest['vol']:.4f} (min>{vm:.3f})",
 }
 
+if page == "Reliability":
+    st.subheader("Reliability check")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Train window", "From ~12 months ago")
+    r2.metric("Test window", "Last month")
+    r3.metric("Signal hit rate", f"{rel['hit']:.1f}%")
+    r4.metric("Test return / DD", f"{rel['rel_return']:+.2f}% / {rel['rel_dd']:.2f}%")
+    st.caption(f"WF folds: {rel['wf_folds']} | avg WF return: {rel['wf_avg']:+.2f}% | AI active: {AI_ENABLED}")
+    if rel['test_df'] is not None:
+        fig_rel = go.Figure()
+        fig_rel.add_trace(go.Scatter(x=rel['test_df'].index, y=rel['test_df']['eq_test'], name='Last-month equity (OOS)'))
+        fig_rel.update_layout(height=320, title='Reliability equity (same full pipeline incl AI/costs)')
+        st.plotly_chart(fig_rel, use_container_width=True)
+    render_portfolio_plots(STATUS_PATH)
+    st.stop()
+
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Ensemble+AI filter | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}, ai={ui_ai_reason}")
+st.caption(f"Auto controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}, ai={ui_ai_reason}, default-ai-only={AI_ENABLED}")
 
 if STATUS_PATH.exists():
     try:
@@ -502,72 +591,6 @@ with st.expander("Why this signal?"):
 if df["drawdown"].min() < -0.06:
     st.warning("Risk guard: drawdown exceeded 6% in this backtest slice.")
 
-
-# Fixed reliability test:
-# Tune on history BEFORE last month, test on last month (no knobs)
-if len(df) > 200:
-    split_idx = max(1, len(df) - max(30, len(df)//12))
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    sh_t, rb_t, rs_t, vm_t, *_ = auto_tune(train_df)
-    _, sig_test, sret_test, eq_test, dd_test = score(test_df.copy(), rb_t, rs_t, vm_t, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
-    test_df['sig_test'] = sig_test
-    test_df['eq_test'] = eq_test
-    test_df['dd_test'] = dd_test
-
-    m = test_df['sig_test'] != 0
-    if m.any():
-        hit = (((test_df['sig_test'].shift(1) * test_df['ret']) > 0) & m).sum() / m.sum() * 100
-    else:
-        hit = 0.0
-    rel_return = (test_df['eq_test'].iloc[-1] - 1) * 100
-    rel_dd = test_df['dd_test'].min() * 100
-else:
-    rb_t, rs_t, vm_t = rb, rs, vm
-    hit, rel_return, rel_dd = 0.0, 0.0, 0.0
-
-# Asset ranking (top edges)
-universe = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AAPL","TSLA","MSFT","NVDA","AMZN","GOOGL","META","SPY","QQQ","GLD"]
-rows=[]
-for a in universe[:8]:  # cap for speed
-    try:
-        d0 = add_features(load_data(a, period, interval), interval)
-        if len(d0) < 120:
-            continue
-        sh0, rb0, rs0, vm0, *_ = auto_tune(d0)
-        rows.append((a, sh0, rb0, rs0, vm0))
-    except Exception:
-        pass
-if rows:
-    rank_df = pd.DataFrame(rows, columns=["asset","score","rsi_buy","rsi_sell","vol_min"]).sort_values("score", ascending=False)
-    st.subheader("Top asset edges (auto-ranked)")
-    st.dataframe(rank_df.head(3), use_container_width=True)
-
-st.subheader("Reliability check (fixed, no settings)")
-r1, r2, r3, r4 = st.columns(4)
-r1.metric("Train window", "From ~12 months ago")
-r2.metric("Test window", "Last month")
-r3.metric("Signal hit rate", f"{hit:.1f}%")
-r4.metric("Test return / DD", f"{rel_return:+.2f}% / {rel_dd:.2f}%")
-
-# simple walk-forward monthly-like folds
-wf_folds = 0
-wf_scores = []
-chunk = max(30, len(df)//10)
-for start in range(max(60, chunk), len(df)-chunk, chunk):
-    tr = df.iloc[:start].copy()
-    te = df.iloc[start:start+chunk].copy()
-    if len(tr) < 80 or len(te) < 20:
-        continue
-    shw, rbw, rsw, vmw, *_ = auto_tune(tr)
-    _, _, sret_w, eq_w, dd_w = score(te, rbw, rsw, vmw, cooldown=cooldown_bars, fee=fee_bps, slippage=slippage_bps, news_blackout=use_news_blackout)
-    wf_scores.append((eq_w.iloc[-1]-1)*100)
-    wf_folds += 1
-if wf_folds:
-    st.caption(f"Walk-forward folds: {wf_folds} | avg test return: {np.mean(wf_scores):+.2f}%")
-
-st.caption(f"Parameters for current reliability test: RSI buy>{rb_t}, RSI sell<{rs_t}, Vol min>{vm_t:.3f}")
 
 # simple paper bot simulation (no real money)
 start_cap = st.sidebar.number_input("Paper start capital (EUR)", min_value=100.0, value=10000.0, step=100.0)
