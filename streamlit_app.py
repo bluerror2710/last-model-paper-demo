@@ -4,7 +4,7 @@ import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import threading, time, json
+import threading, time, json, os, hashlib
 from pathlib import Path
 
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
@@ -46,6 +46,64 @@ def blackout_mask(index):
     idx = pd.to_datetime(index).normalize()
     return idx.isin(dates)
 
+
+
+def ai_filter_signal(base_signal: int, row: pd.Series, context: dict):
+    """Low-token Codex guardrail: returns (signal, risk_mult, reason)."""
+    try:
+        key = os.getenv("OPENAI_API_KEY", "")
+        if not key:
+            return int(base_signal), 1.0, "no_api_key"
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+
+        payload = {
+            "base_signal": int(base_signal),
+            "price": round(float(row.get("close", 0.0)), 4),
+            "rsi": round(float(row.get("rsi", 50.0)), 2),
+            "vol": round(float(row.get("vol", 0.0)), 6),
+            "trend_spread": round(float(row.get("trend_spread", 0.0)), 6),
+            "htf_up": int(row.get("htf_up", 0)),
+            "context": context,
+        }
+        # cache by rounded feature hash to avoid repeated token spend
+        h = hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        cache = st.session_state.get("ai_cache", {})
+        if h in cache:
+            c = cache[h]
+            return int(c.get("signal", base_signal)), float(c.get("risk_mult", 1.0)), c.get("reason", "cached")
+
+        prompt = (
+            "You are a trading risk filter. Return compact JSON only: "
+            '{"signal":-1|0|1,"risk_mult":0..1,"reason":"<=6 words"}. '
+            "Goal: reduce false positives. If uncertain, return signal 0."
+        )
+        resp = client.responses.create(
+            model="gpt-5-codex",
+            input=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload)}
+            ],
+            max_output_tokens=60,
+            temperature=0
+        )
+        txt = (resp.output_text or "").strip()
+        j = json.loads(txt)
+        out_sig = int(j.get("signal", base_signal))
+        out_sig = 1 if out_sig > 0 else (-1 if out_sig < 0 else 0)
+        risk_mult = float(j.get("risk_mult", 1.0))
+        risk_mult = max(0.0, min(1.0, risk_mult))
+        reason = str(j.get("reason", "ai"))[:60]
+        cache[h] = {"signal": out_sig, "risk_mult": risk_mult, "reason": reason}
+        # keep cache small
+        if len(cache) > 200:
+            for k in list(cache.keys())[:100]:
+                cache.pop(k, None)
+        st.session_state["ai_cache"] = cache
+        return out_sig, risk_mult, reason
+    except Exception:
+        return int(base_signal), 1.0, "ai_fallback"
+
 def _status_path(symbol: str, interval: str) -> Path:
     safe = symbol.replace("/", "_").replace("=", "_").replace("-", "_")
     return Path(__file__).with_name(f"bot_status_{safe}_{interval}.json")
@@ -73,11 +131,12 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
             if cooldown_bars > 0 and (i - last_trade_i) <= cooldown_bars:
                 s_now = 0
             last = d.iloc[-1]
+            s_now, ai_risk_mult, ai_reason = ai_filter_signal(s_now, last, {"mode":"single_bot"})
             price = float(last["close"])
 
             if pos != 0 and s_now == -pos:
                 vol_now = float(last.get("vol", 0.01)) if pd.notna(last.get("vol", 0.01)) else 0.01
-                dyn_risk = max(0.002, min(ctl["risk"], 0.01 / max(vol_now, 1e-6)))
+                dyn_risk = max(0.002, min(ctl["risk"] * ai_risk_mult, 0.01 / max(vol_now, 1e-6)))
                 pnl = (price - entry) / entry * pos * (capital * dyn_risk * 5)
                 capital += pnl
                 trades.append(pnl)
@@ -95,7 +154,8 @@ def _bot_loop(symbol: str, period: str, interval: str, status_path: Path, start_
                 "capital": round(capital, 2),
                 "cum_pnl": round(cum_pnl, 2),
                 "cum_pct": round(cum_pct, 2),
-                "controls": ctl
+                "controls": ctl,
+                "ai_reason": ai_reason
             }
             status_path.write_text(json.dumps(status, indent=2))
         except Exception as e:
@@ -123,14 +183,15 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
                     _, sig_live, _, _, _ = score(d.copy(), rb, rs, vm, cooldown=ctl["cooldown"], fee=ctl["fee"], slippage=ctl["slippage"], news_blackout=ctl["news"])
                     s_now = int(sig_live.iloc[-1])
                     px = float(d['close'].iloc[-1])
-                    rows.append((a, sh, s_now, px))
+                    s_now, ai_risk_mult, _ = ai_filter_signal(s_now, d.iloc[-1], {"mode":"portfolio", "asset":a})
+                    rows.append((a, sh, s_now, px, ai_risk_mult))
                 except Exception:
                     continue
 
             if rows:
                 top = sorted(rows, key=lambda x: x[1], reverse=True)[:5]
                 active = [r for r in top if r[2] != 0]
-                avg_risk = np.mean([0.01 for _ in active]) if active else 0.01
+                avg_risk = np.mean([max(0.003, min(0.02, 0.01 * r[4])) for r in active]) if active else 0.01
                 alloc = (capital * avg_risk * 5 / max(1, len(active)))
 
                 # close positions not in active or flipped
@@ -145,7 +206,7 @@ def _portfolio_bot_loop(period: str, interval: str, status_path: Path, start_cap
                         entries.pop(a, None)
 
                 # open/update active
-                for a, sh, s_now, px in active:
+                for a, sh, s_now, px, ai_rm in active:
                     if a not in positions:
                         positions[a] = s_now
                         entries[a] = px
@@ -382,7 +443,8 @@ if df.empty:
     st.stop()
 
 latest = df.iloc[-1]
-sig_now = int(latest["signal"])
+base_sig_now = int(latest["signal"])
+sig_now, ui_ai_risk_mult, ui_ai_reason = ai_filter_signal(base_sig_now, latest, {"mode":"ui_decision"})
 if sig_now == 1:
     decision, color = "BUY", "green"
 elif sig_now == -1:
@@ -398,7 +460,7 @@ reasons = {
 }
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Ensemble active | Auto params: RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
+st.caption(f"Ensemble+AI filter | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}, ai={ui_ai_reason}")
 
 if STATUS_PATH.exists():
     try:
