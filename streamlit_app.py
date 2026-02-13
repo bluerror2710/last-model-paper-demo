@@ -17,7 +17,29 @@ with st.sidebar:
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
     cooldown_bars = st.slider("Cooldown bars", 0, 20, 3)
     max_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
+    fee_bps = st.slider("Fee (bps)", 0.0, 20.0, 5.0, 0.5)
+    slippage_bps = st.slider("Slippage (bps)", 0.0, 30.0, 8.0, 0.5)
+    use_news_blackout = st.checkbox("Use news blackout", value=True)
 
+
+
+def regime_label(row):
+    if row["vol"] > 0.03:
+        return "crash/high-vol"
+    if row["trend_spread"] > 0.002:
+        return "uptrend"
+    if row["trend_spread"] < -0.002:
+        return "downtrend"
+    return "range"
+
+def blackout_mask(index):
+    # Approx major macro dates (demo list; extend as needed)
+    dates = pd.to_datetime([
+        "2025-01-29","2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17","2025-11-05","2025-12-17",
+        "2026-01-28","2026-03-18","2026-05-06"
+    ])
+    idx = pd.to_datetime(index).normalize()
+    return idx.isin(dates)
 
 def _status_path(symbol: str, interval: str) -> Path:
     safe = symbol.replace("/", "_").replace("=", "_").replace("-", "_")
@@ -111,6 +133,14 @@ def add_features(df, interval):
     win = 24 if interval in ["1h", "4h"] else (60 if interval in ["1m", "5m", "15m", "30m"] else 14)
     df["vol"] = df["ret"].rolling(win).std()
     df["trend_spread"] = (df["ema_fast"] - df["ema_slow"]) / df["close"]
+    # higher timeframe confirmation
+    htf = "4h" if interval in ["1m","5m","15m","30m","1h"] else "1d"
+    d2 = df["close"].resample(htf).last().dropna().to_frame("close")
+    d2["ema_hf_fast"] = d2["close"].ewm(span=50, adjust=False).mean()
+    d2["ema_hf_slow"] = d2["close"].ewm(span=200, adjust=False).mean()
+    htrend = (d2["ema_hf_fast"] > d2["ema_hf_slow"]).reindex(df.index, method="ffill").fillna(False)
+    df["htf_up"] = htrend.astype(int)
+    df["regime"] = df.apply(regime_label, axis=1)
 
     return df.dropna()
 
@@ -211,14 +241,28 @@ ens_sig[vote <= -2] = -1
 # fallback to trend signal when ensemble has no vote
 ens_sig = ens_sig.where(ens_sig != 0, trend_sig)
 
+# multi-timeframe confirmation
+ens_sig = ens_sig.where(~((ens_sig == 1) & (df["htf_up"] == 0)), 0)
+ens_sig = ens_sig.where(~((ens_sig == -1) & (df["htf_up"] == 1)), 0)
+
 # risk filter: ignore weak volatility regimes
 ens_sig = ens_sig.where(df["vol"] > max(vm*0.8, 0.001), 0)
 # chop filter: require minimum trend spread
 ens_sig = ens_sig.where(df["trend_spread"].abs() > 0.0015, 0)
 
-# compute returns from ensemble
+# optional news blackout
+if use_news_blackout:
+    ens_sig = ens_sig.where(~blackout_mask(df.index), 0)
+
+# confidence-weighted sizing
+confidence = (vote.abs() / 3.0).clip(0.34, 1.0)
+
+# compute returns from ensemble with execution realism
 pos = ens_sig.replace(0, np.nan).ffill().fillna(0)
-sret = pos.shift(1).fillna(0) * df["ret"].fillna(0)
+gross = pos.shift(1).fillna(0) * df["ret"].fillna(0) * confidence
+turnover = pos.diff().abs().fillna(0)
+cost = turnover * ((fee_bps + slippage_bps) / 10000.0)
+sret = gross - cost
 equity = (1 + sret).cumprod()
 dd = equity / equity.cummax() - 1
 
@@ -307,13 +351,47 @@ else:
     rb_t, rs_t, vm_t = rb, rs, vm
     hit, rel_return, rel_dd = 0.0, 0.0, 0.0
 
+# Asset ranking (top edges)
+universe = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AAPL","TSLA","MSFT","NVDA","AMZN","GOOGL","META","SPY","QQQ","GLD"]
+rows=[]
+for a in universe[:8]:  # cap for speed
+    try:
+        d0 = add_features(load_data(a, period, interval), interval)
+        if len(d0) < 120:
+            continue
+        sh0, rb0, rs0, vm0, *_ = auto_tune(d0)
+        rows.append((a, sh0, rb0, rs0, vm0))
+    except Exception:
+        pass
+if rows:
+    rank_df = pd.DataFrame(rows, columns=["asset","score","rsi_buy","rsi_sell","vol_min"]).sort_values("score", ascending=False)
+    st.subheader("Top asset edges (auto-ranked)")
+    st.dataframe(rank_df.head(3), use_container_width=True)
+
 st.subheader("Reliability check (fixed, no settings)")
 r1, r2, r3, r4 = st.columns(4)
 r1.metric("Train window", "From ~12 months ago")
 r2.metric("Test window", "Last month")
 r3.metric("Signal hit rate", f"{hit:.1f}%")
 r4.metric("Test return / DD", f"{rel_return:+.2f}% / {rel_dd:.2f}%")
-st.caption(f"Parameters for this reliability test: RSI buy>{rb_t}, RSI sell<{rs_t}, Vol min>{vm_t:.3f}")
+
+# simple walk-forward monthly-like folds
+wf_folds = 0
+wf_scores = []
+chunk = max(30, len(df)//10)
+for start in range(max(60, chunk), len(df)-chunk, chunk):
+    tr = df.iloc[:start].copy()
+    te = df.iloc[start:start+chunk].copy()
+    if len(tr) < 80 or len(te) < 20:
+        continue
+    shw, rbw, rsw, vmw, *_ = auto_tune(tr)
+    _, _, sret_w, eq_w, dd_w = score(te, rbw, rsw, vmw)
+    wf_scores.append((eq_w.iloc[-1]-1)*100)
+    wf_folds += 1
+if wf_folds:
+    st.caption(f"Walk-forward folds: {wf_folds} | avg test return: {np.mean(wf_scores):+.2f}%")
+
+st.caption(f"Parameters for current reliability test: RSI buy>{rb_t}, RSI sell<{rs_t}, Vol min>{vm_t:.3f}")
 
 # simple paper bot simulation (no real money)
 start_cap = st.sidebar.number_input("Paper start capital (EUR)", min_value=100.0, value=10000.0, step=100.0)
