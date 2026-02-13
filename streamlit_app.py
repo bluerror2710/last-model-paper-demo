@@ -112,7 +112,7 @@ with st.expander("Why this signal?"):
     st.write(reasons)
 
 # tabs
-T1, T2, T3, T4 = st.tabs(["Price & Signals", "Performance", "Risk", "Distributions"])
+T1, T2, T3, T4, T5 = st.tabs(["Price & Signals", "Performance", "Risk", "Distributions", "Live Safety"])
 
 with T1:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
@@ -155,6 +155,19 @@ with T4:
     by_signal = df.groupby("signal")["ret"].mean().rename({-1: "sell", 0: "hold", 1: "buy"})
     st.write("Average next-period return by signal:")
     st.dataframe(by_signal.to_frame("avg_return"))
+
+with T5:
+    st.subheader("Live safety checklist")
+    st.markdown("""
+- Max open trades: **1**
+- Risk per trade: **<=1% equity**
+- Daily max loss: **2%**
+- Weekly max drawdown stop: **6%**
+- If any risk limit is hit: **STOP bot 24h**
+
+Go live only after **2-4 weeks paper trading** with stable metrics.
+""")
+    st.code('pkill -f "freqtrade trade --userdir freqtrade --config freqtrade/config.paper.json"', language='bash')
 
 st.markdown("### Quick interpretation")
 st.markdown("- **BUY**: trend up + RSI strong + volatility active.\n- **SELL**: trend down + RSI weak + volatility active.\n- **HOLD**: conditions mixed or weak edge.")

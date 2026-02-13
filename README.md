@@ -4,6 +4,8 @@ Includes:
 - `freqtrade/strategies/PaperSafeStrategy.py`
 - `freqtrade/config.paper.json`
 - `notebook_demo.ipynb`
+- `streamlit_app.py`
+- `LIVE_SAFETY_RULES.md`
 
 ## Quick run
 ```bash
