@@ -15,13 +15,8 @@ with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
     interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4)
-    use_custom_dates = st.checkbox("Use custom date range", value=False)
-    if use_custom_dates:
-        start_date = st.date_input("Start date", value=pd.to_datetime("2024-01-01"))
-        end_date = st.date_input("End date", value=pd.Timestamp.today().date())
-    else:
-        start_date = None
-        end_date = None
+    playground_cutoff = st.slider("Playground: analyze up to % of history", 50, 100, 100)
+    reliability_window = st.slider("Playground window (bars)", 100, 3000, 800, 50)
 
 
 STATUS_PATH = Path(__file__).with_name("bot_status.json")
@@ -79,11 +74,8 @@ if interval == "1m" and period in ["2y", "5y", "1y"]:
     period = "7d"
 elif interval in ["5m", "15m", "30m"] and period in ["2y", "5y"]:
     period = "60d"
-def load_data(symbol, period, interval, start_date=None, end_date=None):
-    if start_date is not None and end_date is not None:
-        df = yf.download(symbol, start=str(start_date), end=str(end_date), interval=interval, auto_adjust=True, progress=False)
-    else:
-        df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+def load_data(symbol, period, interval):
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     return df.rename(columns=str.lower).dropna()
@@ -168,7 +160,7 @@ if STATUS_PATH.exists():
 else:
     st.sidebar.info("Bot is starting… status will appear soon.")
 
-raw = load_data(ticker, period, interval, start_date, end_date)
+raw = load_data(ticker, period, interval)
 if raw is None or raw.empty:
     st.error("No data returned for this asset/interval. Try a larger period or different interval.")
     st.stop()
@@ -187,6 +179,20 @@ df["signal"] = sig
 df["strategy_ret"] = sret
 df["equity"] = equity
 df["drawdown"] = dd
+
+# Playground: use historical cutoff so you can inspect past behavior
+if playground_cutoff < 100:
+    cut = max(1, int(len(df) * playground_cutoff / 100))
+    df = df.iloc[:cut].copy()
+
+# Reliability view on recent window
+rel_df = df.tail(min(reliability_window, len(df))).copy()
+mask = rel_df["signal"] != 0
+if mask.any():
+    signal_hits = ((rel_df["signal"].shift(1) * rel_df["ret"]) > 0) & mask
+    reliability = float(signal_hits.sum() / mask.sum() * 100)
+else:
+    reliability = 0.0
 
 if df.empty:
     st.error("Dataset is empty after processing.")
@@ -215,6 +221,7 @@ if STATUS_PATH.exists():
     try:
         bs = json.loads(STATUS_PATH.read_text())
         st.info(f"Bot cumulative P/L: {float(bs.get('cum_pnl',0.0)):+.2f} USD ({float(bs.get('cum_pct',0.0)):+.2f}%)")
+        st.caption(f"Playground cutoff: {playground_cutoff}% of history | Reliability window: {min(reliability_window, len(df))} bars")
     except Exception:
         pass
 
@@ -222,7 +229,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Price", f"{latest['close']:.2f}")
 c2.metric("Proxy return", f"{(df['equity'].iloc[-1]-1)*100:.2f}%")
 c3.metric("Max drawdown", f"{df['drawdown'].min()*100:.2f}%")
-c4.metric("Hit ratio", f"{(df['strategy_ret']>0).mean()*100:.1f}%")
+c4.metric("Reliability (signals)", f"{reliability:.1f}%")
 
 with st.expander("Why this signal?"):
     st.write(reasons)
