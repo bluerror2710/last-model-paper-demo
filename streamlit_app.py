@@ -26,7 +26,7 @@ max_risk_pct = 0.01
 fee_bps = 5.0
 slippage_bps = 8.0
 use_news_blackout = True
-AI_ENABLED = (ticker == "BTC-EUR" and interval == "1h")
+AI_ENABLED = False
 
 
 
@@ -51,62 +51,8 @@ def blackout_mask(index):
 
 
 def ai_filter_signal(base_signal: int, row: pd.Series, context: dict):
-    """Low-token Codex guardrail: returns (signal, risk_mult, reason)."""
-    try:
-        if not AI_ENABLED:
-            return int(base_signal), 1.0, "ai_default_only"
-        key = os.getenv("OPENAI_API_KEY", "")
-        if not key:
-            return int(base_signal), 1.0, "no_api_key"
-        from openai import OpenAI
-        client = OpenAI(api_key=key)
-
-        payload = {
-            "base_signal": int(base_signal),
-            "price": round(float(row.get("close", 0.0)), 4),
-            "rsi": round(float(row.get("rsi", 50.0)), 2),
-            "vol": round(float(row.get("vol", 0.0)), 6),
-            "trend_spread": round(float(row.get("trend_spread", 0.0)), 6),
-            "htf_up": int(row.get("htf_up", 0)),
-            "context": context,
-        }
-        # cache by rounded feature hash to avoid repeated token spend
-        h = hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        cache = st.session_state.get("ai_cache", {})
-        if h in cache:
-            c = cache[h]
-            return int(c.get("signal", base_signal)), float(c.get("risk_mult", 1.0)), c.get("reason", "cached")
-
-        prompt = (
-            "You are a trading risk filter. Return compact JSON only: "
-            '{"signal":-1|0|1,"risk_mult":0..1,"reason":"<=6 words"}. '
-            "Goal: reduce false positives. If uncertain, return signal 0."
-        )
-        resp = client.responses.create(
-            model="gpt-5-codex",
-            input=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload)}
-            ],
-            max_output_tokens=60,
-            temperature=0
-        )
-        txt = (resp.output_text or "").strip()
-        j = json.loads(txt)
-        out_sig = int(j.get("signal", base_signal))
-        out_sig = 1 if out_sig > 0 else (-1 if out_sig < 0 else 0)
-        risk_mult = float(j.get("risk_mult", 1.0))
-        risk_mult = max(0.0, min(1.0, risk_mult))
-        reason = str(j.get("reason", "ai"))[:60]
-        cache[h] = {"signal": out_sig, "risk_mult": risk_mult, "reason": reason}
-        # keep cache small
-        if len(cache) > 200:
-            for k in list(cache.keys())[:100]:
-                cache.pop(k, None)
-        st.session_state["ai_cache"] = cache
-        return out_sig, risk_mult, reason
-    except Exception:
-        return int(base_signal), 1.0, "ai_fallback"
+    # AI disabled: pure rules mode
+    return int(base_signal), 1.0, "ai_disabled"
 
 def _status_path(symbol: str, interval: str) -> Path:
     safe = symbol.replace("/", "_").replace("=", "_").replace("-", "_")
@@ -539,7 +485,7 @@ if page == "Reliability":
     r2.metric("Test window", "Last month")
     r3.metric("Signal hit rate", f"{rel['hit']:.1f}%")
     r4.metric("Test return / DD", f"{rel['rel_return']:+.2f}% / {rel['rel_dd']:.2f}%")
-    st.caption(f"WF folds: {rel['wf_folds']} | avg WF return: {rel['wf_avg']:+.2f}% | AI active: {AI_ENABLED}")
+    st.caption(f"WF folds: {rel['wf_folds']} | avg WF return: {rel['wf_avg']:+.2f}%")
     if rel['test_df'] is not None:
         fig_rel = go.Figure()
         fig_rel.add_trace(go.Scatter(x=rel['test_df'].index, y=rel['test_df']['eq_test'], name='Last-month equity (OOS)'))
@@ -549,7 +495,7 @@ if page == "Reliability":
     st.stop()
 
 st.markdown(f"## Signal now: :{color}[**{decision}**]")
-st.caption(f"Auto controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}, ai={ui_ai_reason}, default-ai-only={AI_ENABLED}")
+st.caption(f"Auto controls | RSI>{rb}/{rs}, vol>{vm:.3f}, cooldown={cooldown_bars}, risk={max_risk_pct*100:.1f}%, fee={fee_bps:.1f}bps, slippage={slippage_bps:.1f}bps, blackout={use_news_blackout}")
 
 if STATUS_PATH.exists():
     try:
