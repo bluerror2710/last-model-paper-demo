@@ -10,7 +10,7 @@ from pathlib import Path
 st.set_page_config(page_title="Auto Signal Pro", layout="wide")
 st.title("🤖 Auto Buy / Hold / Sell — Pro Dashboard")
 st.caption("Auto-tuned per asset/timeframe + ensemble + risk controls. Educational use only.")
-PORTF_UNIVERSE = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AAPL","TSLA","MSFT","NVDA","AMZN","GOOGL","META","SPY","QQQ","GLD"]
+PORTF_UNIVERSE = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AAPL","TSLA","MSFT","NVDA","SPY"]
 
 with st.sidebar:
     ticker = st.selectbox("Asset", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR", "ADA-EUR", "AAPL", "TSLA", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "GLD", "EURUSD=X", "EURJPY=X"], index=0)
@@ -22,6 +22,8 @@ with st.sidebar:
     manual_controls = st.checkbox("Manual controls", value=True)
     manual_cooldown = st.slider("Cooldown bars", 0, 20, 3)
     manual_risk_pct = st.slider("Max risk per trade (%)", 0.2, 3.0, 1.0, 0.1) / 100.0
+    fast_mode = st.checkbox("Fast mode", value=True)
+    run_reliability_now = st.button("Run reliability now")
 
 # auto-found controls (set later by model)
 cooldown_bars = 3
@@ -320,11 +322,14 @@ def score(df, rsi_buy, rsi_sell, vol_min, cooldown=3, fee=5.0, slippage=8.0, new
 
 def auto_tune(df):
     best = (-999, 65, 35, 0.003, None, None, None, None)
-    for rb in [55, 60, 65, 70]:
-        for rs in [30, 35, 40, 45]:
+    rb_grid = [60,65] if fast_mode else [55,60,65,70]
+    rs_grid = [35,40] if fast_mode else [30,35,40,45]
+    vm_grid = [0.002,0.003,0.004] if fast_mode else [0.001,0.002,0.003,0.004,0.006]
+    for rb in rb_grid:
+        for rs in rs_grid:
             if rs >= rb:
                 continue
-            for vm in [0.001, 0.002, 0.003, 0.004, 0.006]:
+            for vm in vm_grid:
                 sh, sig, sret, eq, dd = score(df, rb, rs, vm)
                 if sh > best[0]:
                     best = (sh, rb, rs, vm, sig, sret, eq, dd)
@@ -338,8 +343,10 @@ def auto_controls(df, rb, rs, vm):
     vol_med = float(df["vol"].median()) if "vol" in df else 0.005
     fee_cands = [max(1.0, round(vol_med*12000,1)), 3.0, 5.0, 8.0]
     slip_cands = [max(2.0, round(vol_med*18000,1)), 5.0, 8.0, 12.0]
-    for cd in [1, 2, 3, 5]:
-        for risk in [0.005, 0.007, 0.01, 0.015]:
+    cd_grid = [1,3] if fast_mode else [1,2,3,5]
+    risk_grid = [0.007,0.01] if fast_mode else [0.005,0.007,0.01,0.015]
+    for cd in cd_grid:
+        for risk in risk_grid:
             for nb in [False, True]:
                 sh, *_ = score(df.copy(), rb, rs, vm, cooldown=cd, fee=0.0, slippage=0.0, news_blackout=nb)
                 obj = sh
@@ -461,7 +468,9 @@ if df.empty:
     st.error("Dataset is empty after processing.")
     st.stop()
 
-rel = run_reliability(df.copy(), rb, rs, vm)
+rel = None
+if (page == "Reliability" and run_reliability_now) or (page == "Main" and not fast_mode):
+    rel = run_reliability(df.copy(), rb, rs, vm)
 
 latest = df.iloc[-1]
 base_sig_now = int(latest["signal"])
@@ -482,6 +491,10 @@ reasons = {
 
 if page == "Reliability":
     st.subheader("Reliability check")
+    if rel is None:
+        st.info("Press 'Run reliability now' to compute (faster by default).")
+        render_portfolio_plots(STATUS_PATH)
+        st.stop()
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("Train window", "From ~12 months ago")
     r2.metric("Test window", "Last month")
